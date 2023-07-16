@@ -8,7 +8,7 @@ services:
     ports:
       - '9001:9001' # metrics
       - '30303:30303' # eth/66 peering
-      - '8545:8545' # rpc
+      - '8546:8546' # rpc
       - '8551:8551' # engine
     volumes:
       - rethdata:/root/.local/share/reth/mainnet/db
@@ -22,6 +22,11 @@ services:
       --authrpc.addr 0.0.0.0
       --authrpc.port 8551
       --authrpc.jwtsecret /root/jwt/jwt.hex
+      --ws
+      --ws.addr 0.0.0.0
+      --ws.port 8546
+      --ws.api "all"
+      --ws.origins "*"
 
   prometheus:
     restart: unless-stopped
