@@ -24,6 +24,7 @@ services:
       --authrpc.jwtsecret /root/jwt/jwt.hex
       --ws
       --ws.addr 0.0.0.0
+      --ws.port 8546
       --ws.api "eth,net,web3"
       --ws.origins "*"
 
