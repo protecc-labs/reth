@@ -22,8 +22,10 @@ services:
       --authrpc.addr 0.0.0.0
       --authrpc.port 8551
       --authrpc.jwtsecret /root/jwt/jwt.hex
-      --ws --ws.addr 0.0.0.0 --ws.port 8545
+      --ws
+      --ws.addr 0.0.0.0
       --ws.api "eth,net,web3"
+      --ws.origins "*"
 
   prometheus:
     restart: unless-stopped
