@@ -8,7 +8,8 @@ services:
     ports:
       - '9001:9001' # metrics
       - '30303:30303' # eth/66 peering
-      - '8546:8546' # rpc
+      - '8545:8545' # rpc - http
+      - '8546:8546' # rpc - ws
       - '8551:8551' # engine
     volumes:
       - rethdata:/root/.local/share/reth/mainnet/db
