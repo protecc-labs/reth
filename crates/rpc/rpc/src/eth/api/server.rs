@@ -21,8 +21,9 @@ use reth_provider::{
 };
 use reth_rpc_api::EthApiServer;
 use reth_rpc_types::{
-    state::StateOverride, BlockOverrides, CallRequest, EIP1186AccountProofResponse, FeeHistory,
-    Index, RichBlock, SyncStatus, TransactionReceipt, TransactionRequest, Work,
+    state::StateOverride, BlockOverrides, Bundle, CallRequest, EIP1186AccountProofResponse,
+    EthCallResponse, FeeHistory, Index, RichBlock, StateContext, SyncStatus, TransactionReceipt,
+    TransactionRequest, Work,
 };
 use reth_transaction_pool::TransactionPool;
 use serde_json::Value;
@@ -245,6 +246,17 @@ where
             .await?)
     }
 
+    /// Handler for: `eth_callMany`
+    async fn call_many(
+        &self,
+        bundle: Bundle,
+        state_context: Option<StateContext>,
+        state_override: Option<StateOverride>,
+    ) -> Result<Vec<EthCallResponse>> {
+        trace!(target: "rpc::eth", ?bundle, ?state_context, ?state_override, "Serving eth_callMany");
+        Ok(EthApi::call_many(self, bundle, state_context, state_override).await?)
+    }
+
     /// Handler for: `eth_createAccessList`
     async fn create_access_list(
         &self,
@@ -392,14 +404,14 @@ where
 mod tests {
     use crate::{
         eth::{cache::EthStateCache, gas_oracle::GasPriceOracle},
-        EthApi,
+        EthApi, TracingCallPool,
     };
     use jsonrpsee::types::error::INVALID_PARAMS_CODE;
     use reth_interfaces::test_utils::{generators, generators::Rng};
     use reth_network_api::noop::NoopNetwork;
     use reth_primitives::{
-        basefee::calculate_next_block_base_fee, Block, BlockNumberOrTag, Header, TransactionSigned,
-        H256, U256,
+        basefee::calculate_next_block_base_fee, constants::ETHEREUM_BLOCK_GAS_LIMIT, Block,
+        BlockNumberOrTag, Header, TransactionSigned, H256, U256,
     };
     use reth_provider::{
         test_utils::{MockEthProvider, NoopProvider},
@@ -427,6 +439,8 @@ mod tests {
             NoopNetwork::default(),
             cache.clone(),
             GasPriceOracle::new(provider, Default::default(), cache),
+            ETHEREUM_BLOCK_GAS_LIMIT,
+            TracingCallPool::build().expect("failed to build tracing pool"),
         )
     }
 

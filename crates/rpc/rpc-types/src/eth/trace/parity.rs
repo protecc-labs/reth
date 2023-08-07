@@ -264,18 +264,18 @@ pub struct TransactionTrace {
 pub struct LocalizedTransactionTrace {
     #[serde(flatten)]
     pub trace: TransactionTrace,
-    /// Transaction index within the block, None if pending.
-    pub transaction_position: Option<u64>,
-    /// Hash of the transaction
-    pub transaction_hash: Option<H256>,
-    /// Block number the transaction is included in, None if pending.
-    ///
-    /// Note: this deviates from <https://openethereum.github.io/JSONRPC-trace-module#trace_transaction> which always returns a block number
-    pub block_number: Option<u64>,
     /// Hash of the block, if not pending
     ///
     /// Note: this deviates from <https://openethereum.github.io/JSONRPC-trace-module#trace_transaction> which always returns a block number
     pub block_hash: Option<H256>,
+    /// Block number the transaction is included in, None if pending.
+    ///
+    /// Note: this deviates from <https://openethereum.github.io/JSONRPC-trace-module#trace_transaction> which always returns a block number
+    pub block_number: Option<u64>,
+    /// Hash of the transaction
+    pub transaction_hash: Option<H256>,
+    /// Transaction index within the block, None if pending.
+    pub transaction_position: Option<u64>,
 }
 
 /// A record of a full VM trace for a CALL/CREATE.
@@ -291,14 +291,20 @@ pub struct VmTrace {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmInstruction {
-    /// The program counter.
-    pub pc: usize,
     /// The gas cost for this instruction.
     pub cost: u64,
     /// Information concerning the execution of the operation.
     pub ex: Option<VmExecutedOperation>,
+    /// The program counter.
+    pub pc: usize,
     /// Subordinate trace of the CALL/CREATE if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<VmTrace>,
+    /// Stringified opcode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idx: Option<String>,
 }
 
 /// A record of an executed VM operation.
@@ -308,16 +314,16 @@ pub struct VmExecutedOperation {
     /// The total gas used.
     pub used: u64,
     /// The stack item placed, if any.
-    pub push: Option<H256>,
+    pub push: Vec<H256>,
     /// If altered, the memory delta.
     pub mem: Option<MemoryDelta>,
     /// The altered storage value, if any.
     pub store: Option<StorageDelta>,
 }
 
+/// A diff of some chunk of memory.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// A diff of some chunk of memory.
 pub struct MemoryDelta {
     /// Offset into memory the change begins.
     pub off: usize,
@@ -325,6 +331,7 @@ pub struct MemoryDelta {
     pub data: Bytes,
 }
 
+/// A diff of some storage value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageDelta {
