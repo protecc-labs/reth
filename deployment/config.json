@@ -1,0 +1,27 @@
+  {
+    "name": "Reth",
+    "memoryLimitMiB": 1024,
+    "cpu": 512,
+    "environment": {
+    },
+    "container": {
+      "port": 3000
+    },
+    "scaling": {
+      "requestsPerTarget": 10000
+    },
+    "service": {
+      "desiredCount": 1,
+      "maxCapacity": 3,
+      "targetUtilizationPercent": 80,
+      "scaleInCooldown": 120,
+      "scaleOutCooldown": 120
+    },
+    "healthCheck": {
+      "path": "/",
+      "timeout": 60,
+      "interval": 120,
+      "unhealthyThresholdCount": 5,
+      "healthyThresholdCount": 3
+    }
+  }

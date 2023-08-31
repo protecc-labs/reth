@@ -1,0 +1,57 @@
+name: Test, Build and Deploy Master
+
+on:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  deploy:
+    name: Test, Build and Deploy Master
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      NODE_ENV: "prod"
+    steps:
+      - name: Set env
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV]
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::550933963859:role/protecc-labs-github-Identity
+          aws-region: us-east-1
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "${{ env.NODE_ENV }}PrivateSubnetIDS"
+          env_variable_name: "PRIVATE_SUBNET_IDS"
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "${{ env.NODE_ENV }}PublicSubnetIDS"
+          env_variable_name: "PUBLIC_SUBNET_IDS"
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "${{ env.NODE_ENV }}VpcId"
+          env_variable_name: "VPC_ID"
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "${{ env.NODE_ENV }}SecurityGroupId"
+          env_variable_name: "SERVICE_SECURITY_GROUP_ID"
+
+      - uses: actions/checkout@v2
+
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "16.x"
+
+      - name: Install Typescript and CDK
+        run: npm i -g yarn typescript aws-cdk
+
+      - name: Deploy
+        run: cd deployment && yarn --frozen-lockfile --no-progress && cdk deploy --require-approval never

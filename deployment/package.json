@@ -1,0 +1,23 @@
+{
+  "name": "deployment",
+  "version": "0.1.0",
+  "bin": {
+    "deployment": "bin/protecc.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk",
+    "bootstrap": "cdk bootstrap",
+    "deploy": "cdk deploy",
+    "diff": "cdk diff",
+    "destroy": "cdk destroy"
+  },
+  "devDependencies": {},
+  "dependencies": {
+    "@types/node": "^20.3.1",
+    "aws-cdk-lib": "^2.84.0",
+    "constructs": "^10.2.52"
+  }
+}
