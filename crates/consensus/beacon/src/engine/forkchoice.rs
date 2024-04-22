@@ -1,4 +1,4 @@
-use reth_primitives::H256;
+use reth_primitives::B256;
 use reth_rpc_types::engine::{ForkchoiceState, PayloadStatusEnum};
 
 /// The struct that keeps track of the received forkchoice state and their status.
@@ -46,32 +46,32 @@ impl ForkchoiceStateTracker {
     }
 
     /// Returns whether the latest received FCU is valid: [ForkchoiceStatus::Valid]
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn is_latest_valid(&self) -> bool {
         self.latest_status().map(|s| s.is_valid()).unwrap_or(false)
     }
 
     /// Returns whether the latest received FCU is syncing: [ForkchoiceStatus::Syncing]
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn is_latest_syncing(&self) -> bool {
         self.latest_status().map(|s| s.is_syncing()).unwrap_or(false)
     }
 
     /// Returns whether the latest received FCU is syncing: [ForkchoiceStatus::Invalid]
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn is_latest_invalid(&self) -> bool {
         self.latest_status().map(|s| s.is_invalid()).unwrap_or(false)
     }
 
     /// Returns the last valid head hash.
-    #[allow(unused)]
-    pub(crate) fn last_valid_head(&self) -> Option<H256> {
+    #[allow(dead_code)]
+    pub(crate) fn last_valid_head(&self) -> Option<B256> {
         self.last_valid.as_ref().map(|s| s.head_block_hash)
     }
 
     /// Returns the head hash of the latest received FCU to which we need to sync.
-    #[allow(unused)]
-    pub(crate) fn sync_target(&self) -> Option<H256> {
+    #[allow(dead_code)]
+    pub(crate) fn sync_target(&self) -> Option<B256> {
         self.last_syncing.as_ref().map(|s| s.head_block_hash)
     }
 
@@ -88,7 +88,7 @@ impl ForkchoiceStateTracker {
 
 /// Represents a forkchoice update and tracks the status we assigned to it.
 #[derive(Debug, Clone)]
-#[allow(unused)]
+#[allow(dead_code)]
 pub(crate) struct ReceivedForkchoiceState {
     state: ForkchoiceState,
     status: ForkchoiceStatus,
@@ -121,13 +121,12 @@ impl ForkchoiceStatus {
     /// Converts the general purpose [PayloadStatusEnum] into a [ForkchoiceStatus].
     pub(crate) fn from_payload_status(status: &PayloadStatusEnum) -> Self {
         match status {
-            PayloadStatusEnum::Valid => ForkchoiceStatus::Valid,
-            PayloadStatusEnum::Invalid { .. } => ForkchoiceStatus::Invalid,
-            PayloadStatusEnum::Syncing => ForkchoiceStatus::Syncing,
-            PayloadStatusEnum::Accepted => {
-                // This is only returned on `newPayload` accepted would be a valid state here.
+            PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted => {
+                // `Accepted` is only returned on `newPayload`. It would be a valid state here.
                 ForkchoiceStatus::Valid
             }
+            PayloadStatusEnum::Invalid { .. } => ForkchoiceStatus::Invalid,
+            PayloadStatusEnum::Syncing => ForkchoiceStatus::Syncing,
         }
     }
 }
@@ -141,14 +140,14 @@ impl From<PayloadStatusEnum> for ForkchoiceStatus {
 /// A helper type to check represent hashes of a [ForkchoiceState]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ForkchoiceStateHash {
-    Head(H256),
-    Safe(H256),
-    Finalized(H256),
+    Head(B256),
+    Safe(B256),
+    Finalized(B256),
 }
 
 impl ForkchoiceStateHash {
     /// Tries to find a matching hash in the given [ForkchoiceState].
-    pub(crate) fn find(state: &ForkchoiceState, hash: H256) -> Option<Self> {
+    pub(crate) fn find(state: &ForkchoiceState, hash: B256) -> Option<Self> {
         if state.head_block_hash == hash {
             Some(ForkchoiceStateHash::Head(hash))
         } else if state.safe_block_hash == hash {
@@ -166,11 +165,11 @@ impl ForkchoiceStateHash {
     }
 }
 
-impl AsRef<H256> for ForkchoiceStateHash {
-    fn as_ref(&self) -> &H256 {
+impl AsRef<B256> for ForkchoiceStateHash {
+    fn as_ref(&self) -> &B256 {
         match self {
-            ForkchoiceStateHash::Head(h) => h,
-            ForkchoiceStateHash::Safe(h) => h,
+            ForkchoiceStateHash::Head(h) |
+            ForkchoiceStateHash::Safe(h) |
             ForkchoiceStateHash::Finalized(h) => h,
         }
     }

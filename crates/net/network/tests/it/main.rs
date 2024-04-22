@@ -1,8 +1,10 @@
-mod clique;
+mod big_pooled_txs_req;
 mod connect;
-mod geth;
+mod multiplex;
 mod requests;
 mod session;
 mod startup;
+#[cfg(not(feature = "optimism"))]
+mod txgossip;
 
 fn main() {}

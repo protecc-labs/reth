@@ -4,15 +4,15 @@ use rand::{
 };
 use reth_primitives::{
     proofs, sign_message, Account, Address, BlockNumber, Bytes, Header, Log, Receipt, SealedBlock,
-    SealedHeader, Signature, StorageEntry, Transaction, TransactionKind, TransactionSigned,
-    TxLegacy, H160, H256, U256,
+    SealedHeader, StorageEntry, Transaction, TransactionKind, TransactionSigned, TxLegacy, B256,
+    U256,
 };
-use secp256k1::{KeyPair, Message as SecpMessage, Secp256k1, SecretKey, SECP256K1};
+use secp256k1::{KeyPair, Secp256k1};
 use std::{
     cmp::{max, min},
     collections::{hash_map::DefaultHasher, BTreeMap},
     hash::Hasher,
-    ops::{Range, RangeInclusive, Sub},
+    ops::{Range, RangeInclusive},
 };
 
 // TODO(onbjerg): Maybe we should split this off to its own crate, or move the helpers to the
@@ -39,8 +39,8 @@ pub fn rng() -> StdRng {
 /// The headers are assumed to not be correct if validated.
 pub fn random_header_range<R: Rng>(
     rng: &mut R,
-    range: std::ops::Range<u64>,
-    head: H256,
+    range: Range<u64>,
+    head: B256,
 ) -> Vec<SealedHeader> {
     let mut headers = Vec::with_capacity(range.end.saturating_sub(range.start) as usize);
     for idx in range {
@@ -56,7 +56,7 @@ pub fn random_header_range<R: Rng>(
 /// Generate a random [SealedHeader].
 ///
 /// The header is assumed to not be correct if validated.
-pub fn random_header<R: Rng>(rng: &mut R, number: u64, parent: Option<H256>) -> SealedHeader {
+pub fn random_header<R: Rng>(rng: &mut R, number: u64, parent: Option<B256>) -> SealedHeader {
     let header = reth_primitives::Header {
         number,
         nonce: rng.gen(),
@@ -79,8 +79,8 @@ pub fn random_tx<R: Rng>(rng: &mut R) -> Transaction {
         nonce: rng.gen::<u16>().into(),
         gas_price: rng.gen::<u16>().into(),
         gas_limit: rng.gen::<u16>().into(),
-        to: TransactionKind::Call(Address::random()),
-        value: rng.gen::<u16>().into(),
+        to: TransactionKind::Call(rng.gen()),
+        value: U256::from(rng.gen::<u16>()),
         input: Bytes::default(),
     })
 }
@@ -100,7 +100,7 @@ pub fn random_signed_tx<R: Rng>(rng: &mut R) -> TransactionSigned {
 /// Signs the [Transaction] with the given key pair.
 pub fn sign_tx_with_key_pair(key_pair: KeyPair, tx: Transaction) -> TransactionSigned {
     let signature =
-        sign_message(H256::from_slice(&key_pair.secret_bytes()[..]), tx.signature_hash()).unwrap();
+        sign_message(B256::from_slice(&key_pair.secret_bytes()[..]), tx.signature_hash()).unwrap();
     TransactionSigned::from_transaction_and_signature(tx, signature)
 }
 
@@ -127,7 +127,7 @@ pub fn generate_keys<R: Rng>(rng: &mut R, count: usize) -> Vec<KeyPair> {
 pub fn random_block<R: Rng>(
     rng: &mut R,
     number: u64,
-    parent: Option<H256>,
+    parent: Option<B256>,
     tx_count: Option<u8>,
     ommers_count: Option<u8>,
 ) -> SealedBlock {
@@ -173,7 +173,7 @@ pub fn random_block<R: Rng>(
 pub fn random_block_range<R: Rng>(
     rng: &mut R,
     block_numbers: RangeInclusive<BlockNumber>,
-    head: H256,
+    head: B256,
     tx_count: Range<u8>,
 ) -> Vec<SealedBlock> {
     let mut blocks =
@@ -196,7 +196,6 @@ pub type ChangeSet = Vec<(Address, Account, Vec<StorageEntry>)>;
 type AccountState = (Account, Vec<StorageEntry>);
 
 /// Generate a range of changesets for given blocks and accounts.
-/// Assumes all accounts start with an empty storage.
 ///
 /// Returns a Vec of account and storage changes for each block,
 /// along with the final state of all accounts and storages.
@@ -204,8 +203,8 @@ pub fn random_changeset_range<'a, R: Rng, IBlk, IAcc>(
     rng: &mut R,
     blocks: IBlk,
     accounts: IAcc,
-    n_storage_changes: std::ops::Range<u64>,
-    key_range: std::ops::Range<u64>,
+    n_storage_changes: Range<u64>,
+    key_range: Range<u64>,
 ) -> (Vec<ChangeSet>, BTreeMap<Address, AccountState>)
 where
     IBlk: IntoIterator<Item = &'a SealedBlock>,
@@ -216,11 +215,11 @@ where
         .map(|(addr, (acc, st))| (addr, (acc, st.into_iter().map(|e| (e.key, e.value)).collect())))
         .collect();
 
-    let valid_addresses = state.keys().copied().collect();
+    let valid_addresses = state.keys().copied().collect::<Vec<_>>();
 
     let mut changesets = Vec::new();
 
-    blocks.into_iter().for_each(|block| {
+    for _block in blocks {
         let mut changeset = Vec::new();
         let (from, to, mut transfer, new_entries) = random_account_change(
             rng,
@@ -237,9 +236,9 @@ where
         prev_from.balance = prev_from.balance.wrapping_sub(transfer);
 
         // deposit in receiving account and update storage
-        let (prev_to, storage): &mut (Account, BTreeMap<H256, U256>) = state.get_mut(&to).unwrap();
+        let (prev_to, storage): &mut (Account, BTreeMap<B256, U256>) = state.get_mut(&to).unwrap();
 
-        let old_entries = new_entries
+        let mut old_entries: Vec<_> = new_entries
             .into_iter()
             .filter_map(|entry| {
                 let old = if entry.value != U256::ZERO {
@@ -251,16 +250,19 @@ where
                     }
                     old
                 };
-                Some(StorageEntry { value: old.unwrap_or(U256::from(0)), ..entry })
+                Some(StorageEntry { value: old.unwrap_or(U256::ZERO), ..entry })
             })
             .collect();
+        old_entries.sort_by_key(|entry| entry.key);
 
         changeset.push((to, *prev_to, old_entries));
+
+        changeset.sort_by_key(|(address, _, _)| *address);
 
         prev_to.balance = prev_to.balance.wrapping_add(transfer);
 
         changesets.push(changeset);
-    });
+    }
 
     let final_state = state
         .into_iter()
@@ -276,9 +278,9 @@ where
 /// Returns two addresses, a balance_change, and a Vec of new storage entries.
 pub fn random_account_change<R: Rng>(
     rng: &mut R,
-    valid_addresses: &Vec<Address>,
-    n_storage_changes: std::ops::Range<u64>,
-    key_range: std::ops::Range<u64>,
+    valid_addresses: &[Address],
+    n_storage_changes: Range<u64>,
+    key_range: Range<u64>,
 ) -> (Address, Address, U256, Vec<StorageEntry>) {
     let mut addresses = valid_addresses.choose_multiple(rng, 2).cloned();
 
@@ -299,8 +301,13 @@ pub fn random_account_change<R: Rng>(
 }
 
 /// Generate a random storage change.
-pub fn random_storage_entry<R: Rng>(rng: &mut R, key_range: std::ops::Range<u64>) -> StorageEntry {
-    let key = H256::from_low_u64_be(key_range.sample_single(rng));
+pub fn random_storage_entry<R: Rng>(rng: &mut R, key_range: Range<u64>) -> StorageEntry {
+    let key = B256::new({
+        let n = key_range.sample_single(rng);
+        let mut m = [0u8; 32];
+        m[24..32].copy_from_slice(&n.to_be_bytes());
+        m
+    });
     let value = U256::from(rng.gen::<u64>());
 
     StorageEntry { key, value }
@@ -310,18 +317,15 @@ pub fn random_storage_entry<R: Rng>(rng: &mut R, key_range: std::ops::Range<u64>
 pub fn random_eoa_account<R: Rng>(rng: &mut R) -> (Address, Account) {
     let nonce: u64 = rng.gen();
     let balance = U256::from(rng.gen::<u32>());
-    let addr = H160::from(rng.gen::<u64>());
+    let addr = rng.gen();
 
     (addr, Account { nonce, balance, bytecode_hash: None })
 }
 
 /// Generate random Externally Owned Accounts
-pub fn random_eoa_account_range<R: Rng>(
-    rng: &mut R,
-    acc_range: std::ops::Range<u64>,
-) -> Vec<(Address, Account)> {
-    let mut accounts = Vec::with_capacity(acc_range.end.saturating_sub(acc_range.start) as usize);
-    for _ in acc_range {
+pub fn random_eoa_accounts<R: Rng>(rng: &mut R, accounts_num: usize) -> Vec<(Address, Account)> {
+    let mut accounts = Vec::with_capacity(accounts_num);
+    for _ in 0..accounts_num {
         accounts.push(random_eoa_account(rng))
     }
     accounts
@@ -330,12 +334,13 @@ pub fn random_eoa_account_range<R: Rng>(
 /// Generate random Contract Accounts
 pub fn random_contract_account_range<R: Rng>(
     rng: &mut R,
-    acc_range: &mut std::ops::Range<u64>,
+    acc_range: &mut Range<u64>,
 ) -> Vec<(Address, Account)> {
     let mut accounts = Vec::with_capacity(acc_range.end.saturating_sub(acc_range.start) as usize);
     for _ in acc_range {
         let (address, eoa_account) = random_eoa_account(rng);
-        let account = Account { bytecode_hash: Some(H256::random()), ..eoa_account };
+        // todo: can a non-eoa account have a nonce > 0?
+        let account = Account { bytecode_hash: Some(rng.gen()), ..eoa_account };
         accounts.push((address, account))
     }
     accounts
@@ -358,30 +363,29 @@ pub fn random_receipt<R: Rng>(
         } else {
             vec![]
         },
+        #[cfg(feature = "optimism")]
+        deposit_nonce: None,
+        #[cfg(feature = "optimism")]
+        deposit_receipt_version: None,
     }
 }
 
 /// Generate random log
 pub fn random_log<R: Rng>(rng: &mut R, address: Option<Address>, topics_count: Option<u8>) -> Log {
-    let data_byte_count = rng.gen::<u8>();
-    let topics_count = topics_count.unwrap_or_else(|| rng.gen::<u8>());
-    Log {
-        address: address.unwrap_or_else(|| rng.gen()),
-        topics: (0..topics_count).map(|_| rng.gen()).collect(),
-        data: Bytes::from((0..data_byte_count).map(|_| rng.gen::<u8>()).collect::<Vec<_>>()),
-    }
+    let data_byte_count = rng.gen::<u8>() as usize;
+    let topics_count = topics_count.unwrap_or_else(|| rng.gen()) as usize;
+    Log::new_unchecked(
+        address.unwrap_or_else(|| rng.gen()),
+        std::iter::repeat_with(|| rng.gen()).take(topics_count).collect(),
+        std::iter::repeat_with(|| rng.gen()).take(data_byte_count).collect::<Vec<_>>().into(),
+    )
 }
 
 #[cfg(test)]
-mod test {
-    use std::str::FromStr;
-
+mod tests {
     use super::*;
-    use hex_literal::hex;
-    use reth_primitives::{
-        keccak256, public_key_to_address, AccessList, Address, TransactionKind, TxEip1559,
-    };
-    use secp256k1::KeyPair;
+    use reth_primitives::{hex, public_key_to_address, AccessList, Signature, TxEip1559};
+    use std::str::FromStr;
 
     #[test]
     fn test_sign_message() {
@@ -392,7 +396,7 @@ mod test {
             nonce: 0x42,
             gas_limit: 44386,
             to: TransactionKind::Call(hex!("6069a6c32cf691f5982febae4faf8a6f3ab2f0f6").into()),
-            value: 0_u128,
+            value: U256::from(0_u64),
             input:  hex!("a22cb4650000000000000000000000005eee75727d804a2b13038928d36f8b188945a57a0000000000000000000000000000000000000000000000000000000000000000").into(),
             max_fee_per_gas: 0x4a817c800,
             max_priority_fee_per_gas: 0x3b9aca00,
@@ -404,7 +408,7 @@ mod test {
             let key_pair = KeyPair::new(&secp, &mut rand::thread_rng());
 
             let signature =
-                sign_message(H256::from_slice(&key_pair.secret_bytes()[..]), signature_hash)
+                sign_message(B256::from_slice(&key_pair.secret_bytes()[..]), signature_hash)
                     .unwrap();
 
             let signed = TransactionSigned::from_transaction_and_signature(tx.clone(), signature);
@@ -424,25 +428,23 @@ mod test {
             gas_price: 20 * 10_u128.pow(9),
             gas_limit: 21000,
             to: TransactionKind::Call(hex!("3535353535353535353535353535353535353535").into()),
-            value: 10_u128.pow(18),
+            value: U256::from(10_u128.pow(18)),
             input: Bytes::default(),
         });
 
         // TODO resolve dependency issue
-        // let mut encoded = BytesMut::new();
-        // transaction.encode(&mut encoded);
         // let expected =
         // hex!("ec098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a764000080018080");
-        // assert_eq!(expected, encoded.as_ref());
+        // assert_eq!(expected, &alloy_rlp::encode(transaction));
 
         let hash = transaction.signature_hash();
         let expected =
-            H256::from_str("daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53")
+            B256::from_str("daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53")
                 .unwrap();
         assert_eq!(expected, hash);
 
         let secret =
-            H256::from_str("4646464646464646464646464646464646464646464646464646464646464646")
+            B256::from_str("4646464646464646464646464646464646464646464646464646464646464646")
                 .unwrap();
         let signature = sign_message(secret, hash).unwrap();
 

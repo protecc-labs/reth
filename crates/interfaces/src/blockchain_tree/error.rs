@@ -3,34 +3,86 @@
 use crate::{
     consensus::ConsensusError,
     executor::{BlockExecutionError, BlockValidationError},
+    provider::ProviderError,
+    RethError,
 };
 use reth_primitives::{BlockHash, BlockNumber, SealedBlock};
 
 /// Various error cases that can occur when a block violates tree assumptions.
 #[derive(Debug, Clone, Copy, thiserror::Error, Eq, PartialEq)]
-#[allow(missing_docs)]
 pub enum BlockchainTreeError {
     /// Thrown if the block number is lower than the last finalized block number.
-    #[error("Block number is lower than the last finalized block number #{last_finalized}")]
+    #[error("block number is lower than the last finalized block number #{last_finalized}")]
     PendingBlockIsFinalized {
         /// The block number of the last finalized block.
         last_finalized: BlockNumber,
     },
     /// Thrown if no side chain could be found for the block.
-    #[error("BlockChainId can't be found in BlockchainTree with internal index {chain_id}")]
+    #[error("blockChainId can't be found in BlockchainTree with internal index {chain_id}")]
     BlockSideChainIdConsistency {
         /// The internal identifier for the side chain.
         chain_id: u64,
     },
-    #[error("Canonical chain header #{block_hash} can't be found ")]
-    CanonicalChain { block_hash: BlockHash },
-    #[error("Block number #{block_number} not found in blockchain tree chain")]
-    BlockNumberNotFoundInChain { block_number: BlockNumber },
-    #[error("Block hash {block_hash} not found in blockchain tree chain")]
-    BlockHashNotFoundInChain { block_hash: BlockHash },
-    // Thrown if the block failed to buffer
-    #[error("Block with hash {block_hash:?} failed to buffer")]
-    BlockBufferingFailed { block_hash: BlockHash },
+    /// Thrown if a canonical chain header cannot be found.
+    #[error("canonical chain header {block_hash} can't be found")]
+    CanonicalChain {
+        /// The block hash of the missing canonical chain header.
+        block_hash: BlockHash,
+    },
+    /// Thrown if a block number cannot be found in the blockchain tree chain.
+    #[error("block number #{block_number} not found in blockchain tree chain")]
+    BlockNumberNotFoundInChain {
+        /// The block number that could not be found.
+        block_number: BlockNumber,
+    },
+    /// Thrown if a block hash cannot be found in the blockchain tree chain.
+    #[error("block hash {block_hash} not found in blockchain tree chain")]
+    BlockHashNotFoundInChain {
+        /// The block hash that could not be found.
+        block_hash: BlockHash,
+    },
+    /// Thrown if the block failed to buffer
+    #[error("block with hash {block_hash} failed to buffer")]
+    BlockBufferingFailed {
+        /// The block hash of the block that failed to buffer.
+        block_hash: BlockHash,
+    },
+}
+
+/// Canonical Errors
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalError {
+    /// Error originating from validation operations.
+    #[error(transparent)]
+    Validation(#[from] BlockValidationError),
+    /// Error originating from blockchain tree operations.
+    #[error(transparent)]
+    BlockchainTree(#[from] BlockchainTreeError),
+    /// Error originating from a provider operation.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    /// Error indicating a transaction reverted during execution.
+    #[error("transaction error on revert: {0}")]
+    CanonicalRevert(String),
+    /// Error indicating a transaction failed to commit during execution.
+    #[error("transaction error on commit: {0}")]
+    CanonicalCommit(String),
+}
+
+impl CanonicalError {
+    /// Returns `true` if the error is fatal.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::CanonicalCommit(_) | Self::CanonicalRevert(_))
+    }
+
+    /// Returns `true` if the underlying error matches
+    /// [BlockchainTreeError::BlockHashNotFoundInChain].
+    pub fn is_block_hash_not_found(&self) -> bool {
+        matches!(
+            self,
+            CanonicalError::BlockchainTree(BlockchainTreeError::BlockHashNotFoundInChain { .. })
+        )
+    }
 }
 
 /// Error thrown when inserting a block failed because the block is considered invalid.
@@ -66,6 +118,11 @@ impl InsertBlockError {
     /// Create a new InsertInvalidBlockError from an execution error
     pub fn execution_error(error: BlockExecutionError, block: SealedBlock) -> Self {
         Self::new(block, InsertBlockErrorKind::Execution(error))
+    }
+
+    /// Create a new InsertBlockError from a RethError and block.
+    pub fn from_reth_error(error: RethError, block: SealedBlock) -> Self {
+        Self::new(block, error.into())
     }
 
     /// Consumes the error and returns the block that resulted in the error
@@ -109,8 +166,11 @@ impl std::fmt::Display for InsertBlockErrorData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Failed to insert block (hash={:?}, number={}, parent_hash={:?}): {}",
-            self.block.hash, self.block.number, self.block.parent_hash, self.kind
+            "Failed to insert block (hash={}, number={}, parent_hash={}): {}",
+            self.block.hash(),
+            self.block.number,
+            self.block.parent_hash,
+            self.kind
         )
     }
 }
@@ -119,7 +179,7 @@ impl std::fmt::Debug for InsertBlockErrorData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InsertBlockError")
             .field("error", &self.kind)
-            .field("hash", &self.block.hash)
+            .field("hash", &self.block.hash())
             .field("number", &self.block.number)
             .field("parent_hash", &self.block.parent_hash)
             .field("num_txs", &self.block.body.len())
@@ -147,20 +207,29 @@ impl InsertBlockErrorData {
 #[derive(Debug, thiserror::Error)]
 pub enum InsertBlockErrorKind {
     /// Failed to recover senders for the block
-    #[error("Failed to recover senders for block")]
+    #[error("failed to recover senders for block")]
     SenderRecovery,
     /// Block violated consensus rules.
     #[error(transparent)]
-    Consensus(ConsensusError),
+    Consensus(#[from] ConsensusError),
     /// Block execution failed.
     #[error(transparent)]
-    Execution(BlockExecutionError),
+    Execution(#[from] BlockExecutionError),
     /// Block violated tree invariants.
     #[error(transparent)]
     Tree(#[from] BlockchainTreeError),
+    /// Provider error.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
     /// An internal error occurred, like interacting with the database.
-    #[error("Internal error")]
-    Internal(Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    Internal(#[from] Box<dyn std::error::Error + Send + Sync>),
+    /// Canonical error.
+    #[error(transparent)]
+    Canonical(#[from] CanonicalError),
+    /// BlockchainTree error.
+    #[error(transparent)]
+    BlockchainTree(BlockchainTreeError),
 }
 
 impl InsertBlockErrorKind {
@@ -188,12 +257,14 @@ impl InsertBlockErrorKind {
                         true
                     }
                     // these are internal errors, not caused by an invalid block
-                    BlockExecutionError::ProviderError |
+                    BlockExecutionError::LatestBlock(_) |
+                    BlockExecutionError::Pruning(_) |
                     BlockExecutionError::CanonicalRevert { .. } |
                     BlockExecutionError::CanonicalCommit { .. } |
-                    BlockExecutionError::BlockHashNotFoundInChain { .. } |
                     BlockExecutionError::AppendChainDoesntConnect { .. } |
                     BlockExecutionError::UnavailableForTest => false,
+                    #[cfg(feature = "optimism")]
+                    BlockExecutionError::OptimismBlockExecution(_) => false,
                 }
             }
             InsertBlockErrorKind::Tree(err) => {
@@ -209,10 +280,18 @@ impl InsertBlockErrorKind {
                     BlockchainTreeError::BlockBufferingFailed { .. } => false,
                 }
             }
-            InsertBlockErrorKind::Internal(_) => {
+            InsertBlockErrorKind::Provider(_) | InsertBlockErrorKind::Internal(_) => {
                 // any other error, such as database errors, are considered internal errors
                 false
             }
+            InsertBlockErrorKind::Canonical(err) => match err {
+                CanonicalError::BlockchainTree(_) |
+                CanonicalError::CanonicalCommit(_) |
+                CanonicalError::CanonicalRevert(_) => false,
+                CanonicalError::Validation(_) => true,
+                CanonicalError::Provider(_) => false,
+            },
+            InsertBlockErrorKind::BlockchainTree(_) => false,
         }
     }
 
@@ -261,18 +340,17 @@ impl InsertBlockErrorKind {
     }
 }
 
-// This is a convenience impl to convert from crate::Error to InsertBlockErrorKind, most
-impl From<crate::Error> for InsertBlockErrorKind {
-    fn from(err: crate::Error) -> Self {
-        use crate::Error;
-
+// This is a convenience impl to convert from crate::Error to InsertBlockErrorKind
+impl From<RethError> for InsertBlockErrorKind {
+    fn from(err: RethError) -> Self {
         match err {
-            Error::Execution(err) => InsertBlockErrorKind::Execution(err),
-            Error::Consensus(err) => InsertBlockErrorKind::Consensus(err),
-            Error::Database(err) => InsertBlockErrorKind::Internal(Box::new(err)),
-            Error::Provider(err) => InsertBlockErrorKind::Internal(Box::new(err)),
-            Error::Network(err) => InsertBlockErrorKind::Internal(Box::new(err)),
-            Error::Custom(err) => InsertBlockErrorKind::Internal(err.into()),
+            RethError::Execution(err) => InsertBlockErrorKind::Execution(err),
+            RethError::Consensus(err) => InsertBlockErrorKind::Consensus(err),
+            RethError::Database(err) => InsertBlockErrorKind::Internal(Box::new(err)),
+            RethError::Provider(err) => InsertBlockErrorKind::Internal(Box::new(err)),
+            RethError::Network(err) => InsertBlockErrorKind::Internal(Box::new(err)),
+            RethError::Custom(err) => InsertBlockErrorKind::Internal(err.into()),
+            RethError::Canonical(err) => InsertBlockErrorKind::Canonical(err),
         }
     }
 }

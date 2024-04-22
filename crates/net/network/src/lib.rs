@@ -1,17 +1,3 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
-    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
-    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
-)]
-#![warn(missing_docs)]
-#![deny(unused_must_use, rust_2018_idioms, rustdoc::broken_intra_doc_links)]
-#![allow(rustdoc::private_intra_doc_links)]
-#![doc(test(
-    no_crate_inject,
-    attr(deny(warnings, rust_2018_idioms), allow(dead_code, unused_variables))
-))]
-
 //! reth P2P networking.
 //!
 //! Ethereum's networking protocol is specified in [devp2p](https://github.com/ethereum/devp2p).
@@ -60,10 +46,9 @@
 //!
 //! ```
 //! # async fn launch() {
-//! use reth_network::config::rng_secret_key;
-//! use reth_network::{NetworkConfig, NetworkManager};
-//! use reth_provider::test_utils::NoopProvider;
+//! use reth_network::{config::rng_secret_key, NetworkConfig, NetworkManager};
 //! use reth_primitives::mainnet_nodes;
+//! use reth_provider::test_utils::NoopProvider;
 //!
 //! // This block provider implementation is used for testing purposes.
 //! let client = NoopProvider::default();
@@ -71,9 +56,7 @@
 //! // The key that's used for encrypting sessions and to identify our node.
 //! let local_key = rng_secret_key();
 //!
-//! let config = NetworkConfig::<NoopProvider>::builder(local_key).boot_nodes(
-//!     mainnet_nodes()
-//! ).build(client);
+//! let config = NetworkConfig::builder(local_key).boot_nodes(mainnet_nodes()).build(client);
 //!
 //! // create the network instance
 //! let network = NetworkManager::new(config).await.unwrap();
@@ -88,11 +71,10 @@
 //! ### Configure all components of the Network with the [`NetworkBuilder`]
 //!
 //! ```
+//! use reth_network::{config::rng_secret_key, NetworkConfig, NetworkManager};
+//! use reth_primitives::mainnet_nodes;
 //! use reth_provider::test_utils::NoopProvider;
 //! use reth_transaction_pool::TransactionPool;
-//! use reth_primitives::mainnet_nodes;
-//! use reth_network::config::rng_secret_key;
-//! use reth_network::{NetworkConfig, NetworkManager};
 //! async fn launch<Pool: TransactionPool>(pool: Pool) {
 //!     // This block provider implementation is used for testing purposes.
 //!     let client = NoopProvider::default();
@@ -101,13 +83,14 @@
 //!     let local_key = rng_secret_key();
 //!
 //!     let config =
-//!         NetworkConfig::<NoopProvider>::builder(local_key).boot_nodes(mainnet_nodes()).build(client.clone());
+//!         NetworkConfig::builder(local_key).boot_nodes(mainnet_nodes()).build(client.clone());
+//!     let transactions_manager_config = config.transactions_manager_config.clone();
 //!
 //!     // create the network instance
 //!     let (handle, network, transactions, request_handler) = NetworkManager::builder(config)
 //!         .await
 //!         .unwrap()
-//!         .transactions(pool)
+//!         .transactions(pool, transactions_manager_config)
 //!         .request_handler(client)
 //!         .split_with_handle();
 //! }
@@ -119,10 +102,19 @@
 //! - `test-utils`: Various utilities helpful for writing tests
 //! - `geth-tests`: Runs tests that require Geth to be installed locally.
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
+    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
+    issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
+)]
+#![allow(unreachable_pub)]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 #[cfg(any(test, feature = "test-utils"))]
 /// Common helpers for network testing.
 pub mod test_utils;
 
+mod budget;
 mod builder;
 mod cache;
 pub mod config;
@@ -131,13 +123,14 @@ pub mod error;
 pub mod eth_requests;
 mod fetch;
 mod flattened_response;
-mod import;
+pub mod import;
 mod listener;
 mod manager;
-mod message;
+pub mod message;
 mod metrics;
 mod network;
 pub mod peers;
+pub mod protocol;
 mod session;
 mod state;
 mod swarm;
@@ -145,16 +138,17 @@ pub mod transactions;
 
 pub use builder::NetworkBuilder;
 pub use config::{NetworkConfig, NetworkConfigBuilder};
-pub use discovery::Discovery;
+pub use discovery::{Discovery, DiscoveryEvent};
 pub use fetch::FetchClient;
 pub use manager::{NetworkEvent, NetworkManager};
 pub use message::PeerRequest;
-pub use network::NetworkHandle;
+pub use network::{NetworkEvents, NetworkHandle, NetworkProtocols};
 pub use peers::PeersConfig;
 pub use session::{
     ActiveSessionHandle, ActiveSessionMessage, Direction, PeerInfo, PendingSessionEvent,
     PendingSessionHandle, PendingSessionHandshakeError, SessionCommand, SessionEvent, SessionId,
     SessionLimits, SessionManager, SessionsConfig,
 };
+pub use transactions::{FilterAnnouncement, MessageFilter, ValidateTx68};
 
-pub use reth_eth_wire::{DisconnectReason, HelloBuilder, HelloMessage};
+pub use reth_eth_wire::{DisconnectReason, HelloMessageWithProtocols};

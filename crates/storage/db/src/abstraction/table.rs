@@ -5,15 +5,19 @@ use crate::{
 };
 
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt::Debug,
-    marker::{Send, Sync},
-};
+use std::fmt::Debug;
 
 /// Trait that will transform the data to be saved in the DB in a (ideally) compressed format
 pub trait Compress: Send + Sync + Sized + Debug {
     /// Compressed type.
-    type Compressed: bytes::BufMut + AsMut<[u8]> + Default + AsRef<[u8]> + Send + Sync;
+    type Compressed: bytes::BufMut
+        + AsRef<[u8]>
+        + AsMut<[u8]>
+        + Into<Vec<u8>>
+        + Default
+        + Send
+        + Sync
+        + Debug;
 
     /// If the type cannot be compressed, return its inner reference as `Some(self.as_ref())`
     fn uncompressable_ref(&self) -> Option<&[u8]> {
@@ -35,12 +39,17 @@ pub trait Compress: Send + Sync + Sized + Debug {
 pub trait Decompress: Send + Sync + Sized + Debug {
     /// Decompresses data coming from the database.
     fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError>;
+
+    /// Decompresses owned data coming from the database.
+    fn decompress_owned(value: Vec<u8>) -> Result<Self, DatabaseError> {
+        Self::decompress(value)
+    }
 }
 
 /// Trait that will transform the data to be saved in the DB.
 pub trait Encode: Send + Sync + Sized + Debug {
     /// Encoded type.
-    type Encoded: AsRef<[u8]> + Send + Sync;
+    type Encoded: AsRef<[u8]> + Into<Vec<u8>> + Send + Sync + Ord + Debug;
 
     /// Encodes data going into the database.
     fn encode(self) -> Self::Encoded;
@@ -71,15 +80,23 @@ impl<T> Value for T where T: Compress + Decompress + Serialize {}
 /// It allows for the use of codecs. See [`crate::models::ShardedKey`] for a custom
 /// implementation.
 pub trait Table: Send + Sync + Debug + 'static {
-    /// Return table name as it is present inside the MDBX.
-    const NAME: &'static str;
+    /// The dynamic type of the table.
+    const TABLE: crate::Tables;
+
+    /// The table's name.
+    const NAME: &'static str = Self::TABLE.name();
+
     /// Key element of `Table`.
     ///
     /// Sorting should be taken into account when encoding this.
     type Key: Key;
+
     /// Value element of `Table`.
     type Value: Value;
 }
+
+/// Tuple with `T::Key` and `T::Value`.
+pub type TableRow<T> = (<T as Table>::Key, <T as Table>::Value);
 
 /// DupSort allows for keys to be repeated in the database.
 ///
@@ -94,9 +111,9 @@ pub trait DupSort: Table {
 }
 
 /// Allows duplicating tables across databases
-pub trait TableImporter<'tx>: for<'a> DbTxMut<'a> {
+pub trait TableImporter: DbTxMut {
     /// Imports all table data from another transaction.
-    fn import_table<T: Table, R: DbTx<'tx>>(&self, source_tx: &R) -> Result<(), DatabaseError> {
+    fn import_table<T: Table, R: DbTx>(&self, source_tx: &R) -> Result<(), DatabaseError> {
         let mut destination_cursor = self.cursor_write::<T>()?;
 
         for kv in source_tx.cursor_read::<T>()?.walk(None)? {
@@ -108,7 +125,7 @@ pub trait TableImporter<'tx>: for<'a> DbTxMut<'a> {
     }
 
     /// Imports table data from another transaction within a range.
-    fn import_table_with_range<T: Table, R: DbTx<'tx>>(
+    fn import_table_with_range<T: Table, R: DbTx>(
         &self,
         source_tx: &R,
         from: Option<<T as Table>::Key>,
@@ -133,7 +150,7 @@ pub trait TableImporter<'tx>: for<'a> DbTxMut<'a> {
     }
 
     /// Imports all dupsort data from another transaction.
-    fn import_dupsort<T: DupSort, R: DbTx<'tx>>(&self, source_tx: &R) -> Result<(), DatabaseError> {
+    fn import_dupsort<T: DupSort, R: DbTx>(&self, source_tx: &R) -> Result<(), DatabaseError> {
         let mut destination_cursor = self.cursor_dup_write::<T>()?;
         let mut cursor = source_tx.cursor_dup_read::<T>()?;
 

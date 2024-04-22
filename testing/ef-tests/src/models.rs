@@ -7,11 +7,11 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_primitives::{
-    keccak256, Account as RethAccount, Address, BigEndianHash, Bloom, Bytecode, Bytes, ChainSpec,
-    ChainSpecBuilder, Header as RethHeader, JsonU256, SealedHeader, StorageEntry, Withdrawal, H160,
-    H256, H64, U256,
+    keccak256, Account as RethAccount, Address, Bloom, Bytecode, Bytes, ChainSpec,
+    ChainSpecBuilder, Header as RethHeader, SealedHeader, StorageEntry, Withdrawals, B256, B64,
+    U256,
 };
-use serde::{self, Deserialize};
+use serde::Deserialize;
 use std::{collections::BTreeMap, ops::Deref};
 
 /// The definition of a blockchain test.
@@ -26,16 +26,18 @@ pub struct BlockchainTest {
     /// Block data.
     pub blocks: Vec<Block>,
     /// The expected post state.
-    pub post_state: Option<RootOrState>,
+    pub post_state: Option<BTreeMap<Address, Account>>,
+    /// The expected post state merkle root.
+    pub post_state_hash: Option<B256>,
     /// The test pre-state.
     pub pre: State,
     /// Hash of the best block.
-    pub lastblockhash: H256,
+    pub lastblockhash: B256,
     /// Network spec.
     pub network: ForkSpec,
     #[serde(default)]
     /// Engine spec.
-    pub self_engine: SealEngine,
+    pub seal_engine: SealEngine,
 }
 
 /// A block header in an Ethereum blockchain test.
@@ -47,56 +49,58 @@ pub struct Header {
     /// Coinbase.
     pub coinbase: Address,
     /// Difficulty.
-    pub difficulty: JsonU256,
+    pub difficulty: U256,
     /// Extra data.
     pub extra_data: Bytes,
     /// Gas limit.
-    pub gas_limit: JsonU256,
+    pub gas_limit: U256,
     /// Gas used.
-    pub gas_used: JsonU256,
+    pub gas_used: U256,
     /// Block Hash.
-    pub hash: H256,
+    pub hash: B256,
     /// Mix hash.
-    pub mix_hash: H256,
+    pub mix_hash: B256,
     /// Seal nonce.
-    pub nonce: H64,
+    pub nonce: B64,
     /// Block number.
-    pub number: JsonU256,
+    pub number: U256,
     /// Parent hash.
-    pub parent_hash: H256,
+    pub parent_hash: B256,
     /// Receipt trie.
-    pub receipt_trie: H256,
+    pub receipt_trie: B256,
     /// State root.
-    pub state_root: H256,
+    pub state_root: B256,
     /// Timestamp.
-    pub timestamp: JsonU256,
+    pub timestamp: U256,
     /// Transactions trie.
-    pub transactions_trie: H256,
+    pub transactions_trie: B256,
     /// Uncle hash.
-    pub uncle_hash: H256,
+    pub uncle_hash: B256,
     /// Base fee per gas.
-    pub base_fee_per_gas: Option<JsonU256>,
+    pub base_fee_per_gas: Option<U256>,
     /// Withdrawals root.
-    pub withdrawals_root: Option<H256>,
+    pub withdrawals_root: Option<B256>,
     /// Blob gas used.
-    pub blob_gas_used: Option<JsonU256>,
+    pub blob_gas_used: Option<U256>,
     /// Excess blob gas.
-    pub excess_blob_gas: Option<JsonU256>,
+    pub excess_blob_gas: Option<U256>,
+    /// Parent beacon block root.
+    pub parent_beacon_block_root: Option<B256>,
 }
 
 impl From<Header> for SealedHeader {
     fn from(value: Header) -> Self {
         let header = RethHeader {
-            base_fee_per_gas: value.base_fee_per_gas.map(|v| v.0.to::<u64>()),
+            base_fee_per_gas: value.base_fee_per_gas.map(|v| v.to::<u64>()),
             beneficiary: value.coinbase,
-            difficulty: value.difficulty.0,
+            difficulty: value.difficulty,
             extra_data: value.extra_data,
-            gas_limit: value.gas_limit.0.to::<u64>(),
-            gas_used: value.gas_used.0.to::<u64>(),
+            gas_limit: value.gas_limit.to::<u64>(),
+            gas_used: value.gas_used.to::<u64>(),
             mix_hash: value.mix_hash,
-            nonce: value.nonce.into_uint().as_u64(),
-            number: value.number.0.to::<u64>(),
-            timestamp: value.timestamp.0.to::<u64>(),
+            nonce: u64::from_be_bytes(value.nonce.0),
+            number: value.number.to::<u64>(),
+            timestamp: value.timestamp.to::<u64>(),
             transactions_root: value.transactions_trie,
             receipts_root: value.receipt_trie,
             ommers_hash: value.uncle_hash,
@@ -104,8 +108,9 @@ impl From<Header> for SealedHeader {
             parent_hash: value.parent_hash,
             logs_bloom: value.bloom,
             withdrawals_root: value.withdrawals_root,
-            blob_gas_used: value.blob_gas_used.map(|v| v.0.to::<u64>()),
-            excess_blob_gas: value.excess_blob_gas.map(|v| v.0.to::<u64>()),
+            blob_gas_used: value.blob_gas_used.map(|v| v.to::<u64>()),
+            excess_blob_gas: value.excess_blob_gas.map(|v| v.to::<u64>()),
+            parent_beacon_block_root: value.parent_beacon_block_root,
         };
         header.seal(value.hash)
     }
@@ -126,7 +131,7 @@ pub struct Block {
     /// Transaction Sequence
     pub transaction_sequence: Option<Vec<TransactionSequence>>,
     /// Withdrawals
-    pub withdrawals: Option<Vec<Withdrawal>>,
+    pub withdrawals: Option<Withdrawals>,
 }
 
 /// Transaction sequence in block
@@ -145,28 +150,30 @@ pub struct State(BTreeMap<Address, Account>);
 
 impl State {
     /// Write the state to the database.
-    pub fn write_to_db<'a, Tx>(&self, tx: &'a Tx) -> Result<(), Error>
-    where
-        Tx: DbTxMut<'a>,
-    {
+    pub fn write_to_db(&self, tx: &impl DbTxMut) -> Result<(), Error> {
         for (&address, account) in self.0.iter() {
+            let hashed_address = keccak256(address);
             let has_code = !account.code.is_empty();
             let code_hash = has_code.then(|| keccak256(&account.code));
-            tx.put::<tables::PlainAccountState>(
-                address,
-                RethAccount {
-                    balance: account.balance.0,
-                    nonce: account.nonce.0.to::<u64>(),
-                    bytecode_hash: code_hash,
-                },
-            )?;
+            let reth_account = RethAccount {
+                balance: account.balance,
+                nonce: account.nonce.to::<u64>(),
+                bytecode_hash: code_hash,
+            };
+            tx.put::<tables::PlainAccountState>(address, reth_account)?;
+            tx.put::<tables::HashedAccounts>(hashed_address, reth_account)?;
             if let Some(code_hash) = code_hash {
-                tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(account.code.0.clone()))?;
+                tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(account.code.clone()))?;
             }
-            account.storage.iter().try_for_each(|(k, v)| {
+            account.storage.iter().filter(|(_, v)| !v.is_zero()).try_for_each(|(k, v)| {
+                let storage_key = B256::from_slice(&k.to_be_bytes::<32>());
                 tx.put::<tables::PlainStorageState>(
                     address,
-                    StorageEntry { key: H256::from_slice(&k.0.to_be_bytes::<32>()), value: v.0 },
+                    StorageEntry { key: storage_key, value: *v },
+                )?;
+                tx.put::<tables::HashedStorages>(
+                    hashed_address,
+                    StorageEntry { key: keccak256(storage_key), value: *v },
                 )
             })?;
         }
@@ -183,44 +190,31 @@ impl Deref for State {
     }
 }
 
-/// Merkle root hash or storage accounts.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
-pub enum RootOrState {
-    /// If state is too big, only state root is present
-    Root(H256),
-    /// State
-    State(BTreeMap<Address, Account>),
-}
-
 /// An account.
 #[derive(Debug, PartialEq, Eq, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
     /// Balance.
-    pub balance: JsonU256,
+    pub balance: U256,
     /// Code.
     pub code: Bytes,
     /// Nonce.
-    pub nonce: JsonU256,
+    pub nonce: U256,
     /// Storage.
-    pub storage: BTreeMap<JsonU256, JsonU256>,
+    pub storage: BTreeMap<U256, U256>,
 }
 
 impl Account {
     /// Check that the account matches what is in the database.
     ///
     /// In case of a mismatch, `Err(Error::Assertion)` is returned.
-    pub fn assert_db<'a, Tx>(&self, address: Address, tx: &'a Tx) -> Result<(), Error>
-    where
-        Tx: DbTx<'a>,
-    {
+    pub fn assert_db(&self, address: Address, tx: &impl DbTx) -> Result<(), Error> {
         let account = tx.get::<tables::PlainAccountState>(address)?.ok_or_else(|| {
-            Error::Assertion(format!("Expected account ({address:?}) is missing from DB: {self:?}"))
+            Error::Assertion(format!("Expected account ({address}) is missing from DB: {self:?}"))
         })?;
 
-        assert_equal(self.balance.into(), account.balance, "Balance does not match")?;
-        assert_equal(self.nonce.0.to(), account.nonce, "Nonce does not match")?;
+        assert_equal(self.balance, account.balance, "Balance does not match")?;
+        assert_equal(self.nonce.to(), account.nonce, "Nonce does not match")?;
 
         if let Some(bytecode_hash) = account.bytecode_hash {
             assert_equal(keccak256(&self.code), bytecode_hash, "Bytecode does not match")?;
@@ -235,24 +229,22 @@ impl Account {
         let mut storage_cursor = tx.cursor_dup_read::<tables::PlainStorageState>()?;
         for (slot, value) in self.storage.iter() {
             if let Some(entry) =
-                storage_cursor.seek_by_key_subkey(address, H256(slot.0.to_be_bytes()))?
+                storage_cursor.seek_by_key_subkey(address, B256::new(slot.to_be_bytes()))?
             {
-                if U256::from_be_bytes(entry.key.0) == slot.0 {
+                if U256::from_be_bytes(entry.key.0) == *slot {
                     assert_equal(
-                        value.0,
+                        *value,
                         entry.value,
-                        &format!("Storage for slot {:?} does not match", slot),
+                        &format!("Storage for slot {slot:?} does not match"),
                     )?;
                 } else {
                     return Err(Error::Assertion(format!(
-                        "Slot {:?} is missing from the database. Expected {:?}",
-                        slot, value
+                        "Slot {slot:?} is missing from the database. Expected {value:?}"
                     )))
                 }
             } else {
                 return Err(Error::Assertion(format!(
-                    "Slot {:?} is missing from the database. Expected {:?}",
-                    slot, value
+                    "Slot {slot:?} is missing from the database. Expected {value:?}"
                 )))
             }
         }
@@ -311,6 +303,8 @@ pub enum ForkSpec {
     /// After Merge plus new PUSH0 opcode
     #[serde(alias = "Merge+3855")]
     MergePush0,
+    /// Cancun
+    Cancun,
     /// Fork Spec which is unknown to us
     #[serde(other)]
     Unknown,
@@ -341,6 +335,7 @@ impl From<ForkSpec> for ChainSpec {
             ForkSpec::MergeMeterInitCode => spec_builder.paris_activated(),
             ForkSpec::MergePush0 => spec_builder.paris_activated(),
             ForkSpec::Shanghai => spec_builder.shanghai_activated(),
+            ForkSpec::Cancun => spec_builder.cancun_activated(),
             ForkSpec::ByzantiumToConstantinopleAt5 | ForkSpec::Constantinople => {
                 panic!("Overridden with PETERSBURG")
             }
@@ -354,7 +349,6 @@ impl From<ForkSpec> for ChainSpec {
 
 /// Possible seal engines.
 #[derive(Debug, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum SealEngine {
     /// No consensus checks.
     #[default]
@@ -367,33 +361,33 @@ pub enum SealEngine {
 pub struct Transaction {
     /// Transaction type
     #[serde(rename = "type")]
-    pub transaction_type: Option<JsonU256>,
+    pub transaction_type: Option<U256>,
     /// Data.
     pub data: Bytes,
     /// Gas limit.
-    pub gas_limit: JsonU256,
+    pub gas_limit: U256,
     /// Gas price.
-    pub gas_price: Option<JsonU256>,
+    pub gas_price: Option<U256>,
     /// Nonce.
-    pub nonce: JsonU256,
+    pub nonce: U256,
     /// Signature r part.
-    pub r: JsonU256,
+    pub r: U256,
     /// Signature s part.
-    pub s: JsonU256,
+    pub s: U256,
     /// Parity bit.
-    pub v: JsonU256,
+    pub v: U256,
     /// Transaction value.
-    pub value: JsonU256,
+    pub value: U256,
     /// Chain ID.
-    pub chain_id: Option<JsonU256>,
+    pub chain_id: Option<U256>,
     /// Access list.
     pub access_list: Option<AccessList>,
     /// Max fee per gas.
-    pub max_fee_per_gas: Option<JsonU256>,
+    pub max_fee_per_gas: Option<U256>,
     /// Max priority fee per gas
-    pub max_priority_fee_per_gas: Option<JsonU256>,
+    pub max_priority_fee_per_gas: Option<U256>,
     /// Transaction hash.
-    pub hash: Option<H256>,
+    pub hash: Option<B256>,
 }
 
 /// Access list item
@@ -401,18 +395,17 @@ pub struct Transaction {
 #[serde(rename_all = "camelCase")]
 pub struct AccessListItem {
     /// Account address
-    pub address: H160,
+    pub address: Address,
     /// Storage key.
-    pub storage_keys: Vec<H256>,
+    pub storage_keys: Vec<B256>,
 }
 
 /// Access list.
 pub type AccessList = Vec<AccessListItem>;
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use serde_json;
 
     #[test]
     fn header_deserialize() {

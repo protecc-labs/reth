@@ -5,6 +5,7 @@ use crate::metrics::HeaderDownloaderMetrics;
 use futures::{stream::Stream, FutureExt};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use rayon::prelude::*;
+use reth_config::config::HeadersConfig;
 use reth_interfaces::{
     consensus::Consensus,
     p2p::{
@@ -18,7 +19,8 @@ use reth_interfaces::{
     },
 };
 use reth_primitives::{
-    BlockHashOrNumber, BlockNumber, Header, HeadersDirection, PeerId, SealedHeader, H256,
+    BlockHashOrNumber, BlockNumber, GotExpected, Header, HeadersDirection, PeerId, SealedHeader,
+    B256,
 };
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
@@ -38,13 +40,18 @@ use tracing::{error, trace};
 const REQUESTS_PER_PEER_MULTIPLIER: usize = 5;
 
 /// Wrapper for internal downloader errors.
-#[allow(clippy::large_enum_variant)]
 #[derive(Error, Debug)]
 enum ReverseHeadersDownloaderError {
     #[error(transparent)]
     Downloader(#[from] HeadersDownloaderError),
     #[error(transparent)]
-    Response(#[from] HeadersResponseError),
+    Response(#[from] Box<HeadersResponseError>),
+}
+
+impl From<HeadersResponseError> for ReverseHeadersDownloaderError {
+    fn from(value: HeadersResponseError) -> Self {
+        Self::Response(Box::new(value))
+    }
 }
 
 /// Downloads headers concurrently.
@@ -58,6 +65,7 @@ enum ReverseHeadersDownloaderError {
 /// the batches of headers that this downloader yields will start at the chain tip and move towards
 /// the local head: falling block numbers.
 #[must_use = "Stream does nothing unless polled"]
+#[derive(Debug)]
 pub struct ReverseHeadersDownloader<H: HeadersClient> {
     /// Consensus client used to validate headers
     consensus: Arc<dyn Consensus>,
@@ -201,26 +209,28 @@ where
         header: &SealedHeader,
         request: HeadersRequest,
         peer_id: PeerId,
-    ) -> Result<(), HeadersResponseError> {
+    ) -> Result<(), Box<HeadersResponseError>> {
         match self.existing_sync_target() {
             SyncTargetBlock::Hash(hash) | SyncTargetBlock::HashAndNumber { hash, .. }
                 if header.hash() != hash =>
             {
-                Err(HeadersResponseError {
+                Err(Box::new(HeadersResponseError {
                     request,
                     peer_id: Some(peer_id),
-                    error: DownloadError::InvalidTip { received: header.hash(), expected: hash },
-                })
+                    error: DownloadError::InvalidTip(
+                        GotExpected { got: header.hash(), expected: hash }.into(),
+                    ),
+                }))
             }
             SyncTargetBlock::Number(number) if header.number != number => {
-                Err(HeadersResponseError {
+                Err(Box::new(HeadersResponseError {
                     request,
                     peer_id: Some(peer_id),
-                    error: DownloadError::InvalidTipNumber {
-                        received: header.number,
+                    error: DownloadError::InvalidTipNumber(GotExpected {
+                        got: header.number,
                         expected: number,
-                    },
-                })
+                    }),
+                }))
             }
             _ => Ok(()),
         }
@@ -233,7 +243,6 @@ where
     /// Returns an error if the given headers are invalid.
     ///
     /// Caution: this expects the `headers` to be sorted with _falling_ block numbers
-    #[allow(clippy::result_large_err)]
     fn process_next_headers(
         &mut self,
         request: HeadersRequest,
@@ -249,7 +258,7 @@ where
                 validated.last().or_else(|| self.lowest_validated_header())
             {
                 if let Err(error) = self.validate(validated_header, &parent) {
-                    trace!(target: "downloaders::headers", ?error ,"Failed to validate header");
+                    trace!(target: "downloaders::headers", %error ,"Failed to validate header");
                     return Err(
                         HeadersResponseError { request, peer_id: Some(peer_id), error }.into()
                     )
@@ -269,11 +278,15 @@ where
         {
             // Every header must be valid on its own
             if let Err(error) = self.consensus.validate_header(last_header) {
-                trace!(target: "downloaders::headers", ?error, "Failed to validate header");
+                trace!(target: "downloaders::headers", %error, "Failed to validate header");
                 return Err(HeadersResponseError {
                     request,
                     peer_id: Some(peer_id),
-                    error: DownloadError::HeaderValidation { hash: head.hash(), error },
+                    error: DownloadError::HeaderValidation {
+                        hash: head.hash(),
+                        number: head.number,
+                        error: Box::new(error),
+                    },
                 }
                 .into())
             }
@@ -282,10 +295,10 @@ where
             // detached head error.
             if let Err(error) = self.consensus.validate_header_against_parent(last_header, head) {
                 // Replace the last header with a detached variant
-                error!(target: "downloaders::headers", ?error, number = last_header.number, hash = ?last_header.hash, "Header cannot be attached to known canonical chain");
+                error!(target: "downloaders::headers", %error, number = last_header.number, hash = ?last_header.hash(), "Header cannot be attached to known canonical chain");
                 return Err(HeadersDownloaderError::DetachedHead {
-                    local_head: head.clone(),
-                    header: last_header.clone(),
+                    local_head: Box::new(head.clone()),
+                    header: Box::new(last_header.clone()),
                     error: Box::new(error),
                 }
                 .into())
@@ -339,7 +352,6 @@ where
     }
 
     /// Handles the response for the request for the sync target
-    #[allow(clippy::result_large_err)]
     fn on_sync_target_outcome(
         &mut self,
         response: HeadersRequestOutcome,
@@ -373,10 +385,9 @@ where
                             return Err(HeadersResponseError {
                                 request,
                                 peer_id: Some(peer_id),
-                                error: DownloadError::InvalidTip {
-                                    received: target.hash(),
-                                    expected: hash,
-                                },
+                                error: DownloadError::InvalidTip(
+                                    GotExpected { got: target.hash(), expected: hash }.into(),
+                                ),
                             }
                             .into())
                         }
@@ -386,10 +397,10 @@ where
                             return Err(HeadersResponseError {
                                 request,
                                 peer_id: Some(peer_id),
-                                error: DownloadError::InvalidTipNumber {
-                                    received: target.number,
+                                error: DownloadError::InvalidTipNumber(GotExpected {
+                                    got: target.number,
                                     expected: number,
-                                },
+                                }),
                             }
                             .into())
                         }
@@ -399,10 +410,9 @@ where
                             return Err(HeadersResponseError {
                                 request,
                                 peer_id: Some(peer_id),
-                                error: DownloadError::InvalidTip {
-                                    received: target.hash(),
-                                    expected: hash,
-                                },
+                                error: DownloadError::InvalidTip(
+                                    GotExpected { got: target.hash(), expected: hash }.into(),
+                                ),
                             }
                             .into())
                         }
@@ -431,7 +441,6 @@ where
     }
 
     /// Invoked when we received a response
-    #[allow(clippy::result_large_err)]
     fn on_headers_outcome(
         &mut self,
         response: HeadersRequestOutcome,
@@ -460,10 +469,10 @@ where
                 if (headers.len() as u64) != request.limit {
                     return Err(HeadersResponseError {
                         peer_id: Some(peer_id),
-                        error: DownloadError::HeadersResponseTooShort {
-                            received: headers.len() as u64,
+                        error: DownloadError::HeadersResponseTooShort(GotExpected {
+                            got: headers.len() as u64,
                             expected: request.limit,
-                        },
+                        }),
                         request,
                     }
                     .into())
@@ -481,10 +490,10 @@ where
                     return Err(HeadersResponseError {
                         request,
                         peer_id: Some(peer_id),
-                        error: DownloadError::HeadersResponseStartBlockMismatch {
-                            received: highest.number,
+                        error: DownloadError::HeadersResponseStartBlockMismatch(GotExpected {
+                            got: highest.number,
                             expected: requested_block_number,
-                        },
+                        }),
                     }
                     .into())
                 }
@@ -521,7 +530,7 @@ where
     fn penalize_peer(&self, peer_id: Option<PeerId>, error: &DownloadError) {
         // Penalize the peer for bad response
         if let Some(peer_id) = peer_id {
-            trace!(target: "downloaders::headers", ?peer_id, ?error, "Penalizing peer");
+            trace!(target: "downloaders::headers", ?peer_id, %error, "Penalizing peer");
             self.client.report_bad_message(peer_id);
         }
     }
@@ -529,8 +538,8 @@ where
     /// Handles the error of a bad response
     ///
     /// This will re-submit the request.
-    fn on_headers_error(&mut self, err: HeadersResponseError) {
-        let HeadersResponseError { request, peer_id, error } = err;
+    fn on_headers_error(&mut self, err: Box<HeadersResponseError>) {
+        let HeadersResponseError { request, peer_id, error } = *err;
 
         self.penalize_peer(peer_id, &error);
 
@@ -643,8 +652,7 @@ where
         self.into_task_with(&TokioTaskExecutor::default())
     }
 
-    /// Convert the downloader into a [`TaskDownloader`](super::task::TaskDownloader) by spawning
-    /// it via the given `spawner`.
+    /// Convert the downloader into a [`TaskDownloader`] by spawning it via the given `spawner`.
     pub fn into_task_with<S>(self, spawner: &S) -> TaskDownloader
     where
         S: TaskSpawner,
@@ -768,7 +776,7 @@ where
                     match this.on_sync_target_outcome(outcome) {
                         Ok(()) => break,
                         Err(ReverseHeadersDownloaderError::Response(error)) => {
-                            trace!(target: "downloaders::headers", ?error, "invalid sync target response");
+                            trace!(target: "downloaders::headers", %error, "invalid sync target response");
                             if error.is_channel_closed() {
                                 // download channel closed which means the network was dropped
                                 return Poll::Ready(None)
@@ -885,6 +893,7 @@ where
 }
 
 /// A future that returns a list of [`Header`] on success.
+#[derive(Debug)]
 struct HeadersRequestFuture<F> {
     request: Option<HeadersRequest>,
     fut: F,
@@ -920,6 +929,7 @@ impl HeadersRequestOutcome {
 }
 
 /// Wrapper type to order responses
+#[derive(Debug)]
 struct OrderedHeadersResponse {
     headers: Vec<Header>,
     request: HeadersRequest,
@@ -955,10 +965,12 @@ impl Ord for OrderedHeadersResponse {
 }
 
 /// Type returned if a bad response was processed
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("error requesting headers from peer {peer_id:?}: {error}; request: {request:?}")]
 struct HeadersResponseError {
     request: HeadersRequest,
     peer_id: Option<PeerId>,
+    #[source]
     error: DownloadError,
 }
 
@@ -972,30 +984,18 @@ impl HeadersResponseError {
     }
 }
 
-impl std::fmt::Display for HeadersResponseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Error requesting headers from peer {:?}. Error: {}. Request: {:?}",
-            self.peer_id, self.error, self.request,
-        )
-    }
-}
-
-impl std::error::Error for HeadersResponseError {}
-
 /// The block to which we want to close the gap: (local head...sync target]
 /// This tracks the sync target block, so this could be either a block number or hash.
 #[derive(Clone, Debug)]
 pub enum SyncTargetBlock {
     /// Block hash of the targeted block
-    Hash(H256),
+    Hash(B256),
     /// Block number of the targeted block
     Number(u64),
     /// Both the block hash and number of the targeted block
     HashAndNumber {
         /// Block hash of the targeted block
-        hash: H256,
+        hash: B256,
         /// Block number of the targeted block
         number: u64,
     },
@@ -1003,7 +1003,7 @@ pub enum SyncTargetBlock {
 
 impl SyncTargetBlock {
     /// Create new instance from hash.
-    fn from_hash(hash: H256) -> Self {
+    fn from_hash(hash: B256) -> Self {
         Self::Hash(hash)
     }
 
@@ -1013,7 +1013,7 @@ impl SyncTargetBlock {
     }
 
     /// Set the hash for the sync target.
-    fn with_hash(self, hash: H256) -> Self {
+    fn with_hash(self, hash: B256) -> Self {
         match self {
             Self::Hash(_) => Self::Hash(hash),
             Self::Number(number) => Self::HashAndNumber { hash, number },
@@ -1054,7 +1054,7 @@ impl SyncTargetBlock {
     }
 
     /// Return the hash of the target block, if it is set.
-    fn hash(&self) -> Option<H256> {
+    fn hash(&self) -> Option<B256> {
         match self {
             Self::Hash(hash) => Some(*hash),
             Self::Number(_) => None,
@@ -1086,6 +1086,19 @@ pub struct ReverseHeadersDownloaderBuilder {
     max_concurrent_requests: usize,
     /// How many responses to buffer
     max_buffered_responses: usize,
+}
+
+impl ReverseHeadersDownloaderBuilder {
+    /// Creates a new [ReverseHeadersDownloaderBuilder] with configurations based on the provided
+    /// [HeadersConfig].
+    pub fn new(config: HeadersConfig) -> Self {
+        ReverseHeadersDownloaderBuilder::default()
+            .request_limit(config.downloader_request_limit)
+            .min_concurrent_requests(config.downloader_min_concurrent_requests)
+            .max_concurrent_requests(config.downloader_max_concurrent_requests)
+            .max_buffered_responses(config.downloader_max_buffered_responses)
+            .stream_batch_size(config.commit_threshold as usize)
+    }
 }
 
 impl Default for ReverseHeadersDownloaderBuilder {
@@ -1189,7 +1202,7 @@ impl ReverseHeadersDownloaderBuilder {
 
 /// Configures and returns the next [HeadersRequest] based on the given parameters
 ///
-/// The request wil start at the given `next_request_block_number` block.
+/// The request will start at the given `next_request_block_number` block.
 /// The `limit` of the request will either be the targeted `request_limit` or the difference of
 /// `next_request_block_number` and the `local_head` in case this is smaller than the targeted
 /// `request_limit`.
@@ -1213,7 +1226,6 @@ mod tests {
     use crate::headers::test_utils::child_header;
     use assert_matches::assert_matches;
     use reth_interfaces::test_utils::{TestConsensus, TestHeadersClient};
-    use reth_primitives::SealedHeader;
 
     /// Tests that `replace_number` works the same way as Option::replace
     #[test]
@@ -1235,7 +1247,7 @@ mod tests {
 
         let fixtures = vec![
             Fixture {
-                sync_target_block: SyncTargetBlock::Hash(H256::random()),
+                sync_target_block: SyncTargetBlock::Hash(B256::random()),
                 // Hash maps to None here, all other variants map to Some
                 sync_target_option: None,
                 replace_number: 1,
@@ -1251,7 +1263,7 @@ mod tests {
             },
             Fixture {
                 sync_target_block: SyncTargetBlock::HashAndNumber {
-                    hash: H256::random(),
+                    hash: B256::random(),
                     number: 1,
                 },
                 sync_target_option: Some(1),
@@ -1284,16 +1296,16 @@ mod tests {
         let mut downloader = ReverseHeadersDownloaderBuilder::default()
             .build(Arc::clone(&client), Arc::new(TestConsensus::default()));
         downloader.update_local_head(genesis);
-        downloader.update_sync_target(SyncTarget::Tip(H256::random()));
+        downloader.update_sync_target(SyncTarget::Tip(B256::random()));
 
         downloader.sync_target_request.take();
 
-        let target = SyncTarget::Tip(H256::random());
+        let target = SyncTarget::Tip(B256::random());
         downloader.update_sync_target(target);
         assert!(downloader.sync_target_request.is_some());
 
         downloader.sync_target_request.take();
-        let target = SyncTarget::Gap(Header::default().seal(H256::random()));
+        let target = SyncTarget::Gap(Header::default().seal(B256::random()));
         downloader.update_sync_target(target);
         assert!(downloader.sync_target_request.is_none());
         assert_matches!(
@@ -1312,12 +1324,12 @@ mod tests {
         let mut downloader = ReverseHeadersDownloaderBuilder::default()
             .build(Arc::clone(&client), Arc::new(TestConsensus::default()));
         downloader.update_local_head(header.clone());
-        downloader.update_sync_target(SyncTarget::Tip(H256::random()));
+        downloader.update_sync_target(SyncTarget::Tip(B256::random()));
 
         downloader.queued_validated_headers.push(header.clone());
         let mut next = header.as_ref().clone();
         next.number += 1;
-        downloader.update_local_head(next.seal(H256::random()));
+        downloader.update_local_head(next.seal(B256::random()));
         assert!(downloader.queued_validated_headers.is_empty());
     }
 
@@ -1353,7 +1365,7 @@ mod tests {
             .request_limit(batch_size)
             .build(Arc::clone(&client), Arc::new(TestConsensus::default()));
         downloader.update_local_head(genesis);
-        downloader.update_sync_target(SyncTarget::Tip(H256::random()));
+        downloader.update_sync_target(SyncTarget::Tip(B256::random()));
 
         downloader.next_request_block_number = start;
 

@@ -1,16 +1,3 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
-    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
-    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
-)]
-#![warn(missing_docs, unused_crate_dependencies)]
-#![deny(unused_must_use, rust_2018_idioms)]
-#![doc(test(
-    no_crate_inject,
-    attr(deny(warnings, rust_2018_idioms), allow(dead_code, unused_variables))
-))]
-
 //! Discovery v4 implementation: <https://github.com/ethereum/devp2p/blob/master/discv4.md>
 //!
 //! Discv4 employs a kademlia-like routing table to store and manage discovered peers and topics.
@@ -28,10 +15,20 @@
 //!
 //! - `serde` (default): Enable serde support
 //! - `test-utils`: Export utilities for testing
+
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
+    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
+    issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
+)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use crate::{
     error::{DecodePacketError, Discv4Error},
     proto::{FindNode, Message, Neighbours, Packet, Ping, Pong},
 };
+use alloy_rlp::{RlpDecodable, RlpEncodable};
 use discv5::{
     kbucket,
     kbucket::{
@@ -40,19 +37,16 @@ use discv5::{
     },
     ConnectionDirection, ConnectionState,
 };
-use enr::{Enr, EnrBuilder};
+use enr::Enr;
+use parking_lot::Mutex;
 use proto::{EnrRequest, EnrResponse, EnrWrapper};
-use reth_primitives::{
-    bytes::{Bytes, BytesMut},
-    ForkId, PeerId, H256,
-};
-use reth_rlp::{RlpDecodable, RlpEncodable};
+use reth_primitives::{bytes::Bytes, hex, ForkId, PeerId, B256};
 use secp256k1::SecretKey;
 use std::{
     cell::RefCell,
     collections::{btree_map, hash_map::Entry, BTreeMap, HashMap, VecDeque},
-    io,
-    net::{IpAddr, SocketAddr},
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -66,10 +60,10 @@ use tokio::{
     time::Interval,
 };
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 pub mod error;
-mod proto;
+pub mod proto;
 
 mod config;
 pub use config::{Discv4Config, Discv4ConfigBuilder};
@@ -77,20 +71,44 @@ pub use config::{Discv4Config, Discv4ConfigBuilder};
 mod node;
 use node::{kad_key, NodeKey};
 
+mod table;
+
 // reexport NodeRecord primitive
 pub use reth_primitives::NodeRecord;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+use crate::table::PongTable;
 use reth_net_nat::ResolveNatInterval;
 /// reexport to get public ip.
 pub use reth_net_nat::{external_ip, NatResolver};
+
+/// The default address for discv4 via UDP
+///
+/// Note: the default TCP address is the same.
+pub const DEFAULT_DISCOVERY_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// The default port for discv4 via UDP
 ///
 /// Note: the default TCP port is the same.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 30303;
+
+/// The default address for discv5 via UDP.
+///
+/// Note: the default TCP address is the same.
+pub const DEFAULT_DISCOVERY_V5_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// The default port for discv5 via UDP.
+///
+/// Default is port 9000.
+pub const DEFAULT_DISCOVERY_V5_PORT: u16 = 9000;
+
+/// The default address for discv4 via UDP: "0.0.0.0:30303"
+///
+/// Note: The default TCP address is the same.
+pub const DEFAULT_DISCOVERY_ADDRESS: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_DISCOVERY_PORT));
 
 /// The maximum size of any packet is 1280 bytes.
 const MAX_PACKET_SIZE: usize = 1280;
@@ -117,6 +135,15 @@ const SAFE_MAX_DATAGRAM_NEIGHBOUR_RECORDS: usize = (MAX_PACKET_SIZE - 109) / 91;
 /// Mirrors geth's `bondExpiration` of 24h
 const ENDPOINT_PROOF_EXPIRATION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Duration used to expire nodes from the routing table 1hr
+const EXPIRE_DURATION: Duration = Duration::from_secs(60 * 60);
+
+// Restricts how many udp messages can be processed in a single [Discv4Service::poll] call.
+//
+// This will act as a manual yield point when draining the socket messages where the most CPU
+// expensive part is handling outgoing messages: encoding and hashing the packet
+const UDP_MESSAGE_POLL_LOOP_BUDGET: i32 = 4;
+
 type EgressSender = mpsc::Sender<(Bytes, SocketAddr)>;
 type EgressReceiver = mpsc::Receiver<(Bytes, SocketAddr)>;
 
@@ -126,12 +153,20 @@ pub(crate) type IngressReceiver = mpsc::Receiver<IngressEvent>;
 type NodeRecordSender = OneshotSender<Vec<NodeRecord>>;
 
 /// The Discv4 frontend
+///
+/// This communicates with the [Discv4Service] by sending commands over a channel.
+///
+/// See also [Discv4::spawn]
 #[derive(Debug, Clone)]
 pub struct Discv4 {
     /// The address of the udp socket
     local_addr: SocketAddr,
     /// channel to send commands over to the service
-    to_service: mpsc::Sender<Discv4Command>,
+    to_service: mpsc::UnboundedSender<Discv4Command>,
+    /// Tracks the local node record.
+    ///
+    /// This includes the currently tracked external IP address of the node.
+    node_record: Arc<Mutex<NodeRecord>>,
 }
 
 // === impl Discv4 ===
@@ -157,46 +192,48 @@ impl Discv4 {
     /// NOTE: this is only intended for test setups.
     #[cfg(feature = "test-utils")]
     pub fn noop() -> Self {
-        let (to_service, _rx) = mpsc::channel(1);
+        let (to_service, _rx) = mpsc::unbounded_channel();
         let local_addr =
             (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into();
-        Self { local_addr, to_service }
+        Self {
+            local_addr,
+            to_service,
+            node_record: Arc::new(Mutex::new(NodeRecord::new(
+                "127.0.0.1:3030".parse().unwrap(),
+                PeerId::random(),
+            ))),
+        }
     }
 
     /// Binds a new UdpSocket and creates the service
     ///
     /// ```
     /// # use std::io;
-    /// use std::net::SocketAddr;
-    /// use std::str::FromStr;
     /// use rand::thread_rng;
-    /// use secp256k1::SECP256K1;
-    /// use reth_primitives::{NodeRecord, PeerId};
     /// use reth_discv4::{Discv4, Discv4Config};
+    /// use reth_primitives::{pk2id, NodeRecord, PeerId};
+    /// use secp256k1::SECP256K1;
+    /// use std::{net::SocketAddr, str::FromStr};
     /// # async fn t() -> io::Result<()> {
     /// // generate a (random) keypair
-    ///  let mut rng = thread_rng();
-    ///  let (secret_key, pk) = SECP256K1.generate_keypair(&mut rng);
-    ///  let id = PeerId::from_slice(&pk.serialize_uncompressed()[1..]);
+    /// let mut rng = thread_rng();
+    /// let (secret_key, pk) = SECP256K1.generate_keypair(&mut rng);
+    /// let id = pk2id(&pk);
     ///
-    ///  let socket = SocketAddr::from_str("0.0.0.0:0").unwrap();
-    ///  let local_enr = NodeRecord {
-    ///      address: socket.ip(),
-    ///      tcp_port: socket.port(),
-    ///      udp_port: socket.port(),
-    ///      id,
-    ///  };
-    ///  let config = Discv4Config::default();
+    /// let socket = SocketAddr::from_str("0.0.0.0:0").unwrap();
+    /// let local_enr =
+    ///     NodeRecord { address: socket.ip(), tcp_port: socket.port(), udp_port: socket.port(), id };
+    /// let config = Discv4Config::default();
     ///
-    ///  let(discv4, mut service) = Discv4::bind(socket, local_enr, secret_key, config).await.unwrap();
+    /// let (discv4, mut service) = Discv4::bind(socket, local_enr, secret_key, config).await.unwrap();
     ///
-    ///   // get an update strea
-    ///   let updates = service.update_stream();
+    /// // get an update strea
+    /// let updates = service.update_stream();
     ///
-    ///   let _handle = service.spawn();
+    /// let _handle = service.spawn();
     ///
-    ///   // lookup the local node in the DHT
-    ///   let _discovered = discv4.lookup_self().await.unwrap();
+    /// // lookup the local node in the DHT
+    /// let _discovered = discv4.lookup_self().await.unwrap();
     ///
     /// # Ok(())
     /// # }
@@ -210,12 +247,10 @@ impl Discv4 {
         let socket = UdpSocket::bind(local_address).await?;
         let local_addr = socket.local_addr()?;
         local_node_record.udp_port = local_addr.port();
-        trace!( target : "discv4",  ?local_addr,"opened UDP socket");
+        trace!(target: "discv4", ?local_addr,"opened UDP socket");
 
-        let (to_service, rx) = mpsc::channel(100);
-        let service =
-            Discv4Service::new(socket, local_addr, local_node_record, secret_key, config, Some(rx));
-        let discv4 = Discv4 { local_addr, to_service };
+        let service = Discv4Service::new(socket, local_addr, local_node_record, secret_key, config);
+        let discv4 = service.handle();
         Ok((discv4, service))
     }
 
@@ -224,9 +259,21 @@ impl Discv4 {
         self.local_addr
     }
 
+    /// Returns the [NodeRecord] of the local node.
+    ///
+    /// This includes the currently tracked external IP address of the node.
+    pub fn node_record(&self) -> NodeRecord {
+        *self.node_record.lock()
+    }
+
+    /// Returns the currently tracked external IP of the node.
+    pub fn external_ip(&self) -> IpAddr {
+        self.node_record.lock().address
+    }
+
     /// Sets the [Interval] used for periodically looking up targets over the network
     pub fn set_lookup_interval(&self, duration: Duration) {
-        self.safe_send_to_service(Discv4Command::SetLookupInterval(duration))
+        self.send_to_service(Discv4Command::SetLookupInterval(duration))
     }
 
     /// Starts a `FindNode` recursive lookup that locates the closest nodes to the given node id. See also: <https://github.com/ethereum/devp2p/blob/master/discv4.md#recursive-lookup>
@@ -247,15 +294,29 @@ impl Discv4 {
         self.lookup_node(None).await
     }
 
-    /// Looks up the given node id
+    /// Looks up the given node id.
+    ///
+    /// Returning the closest nodes to the given node id.
     pub async fn lookup(&self, node_id: PeerId) -> Result<Vec<NodeRecord>, Discv4Error> {
         self.lookup_node(Some(node_id)).await
+    }
+
+    /// Performs a random lookup for node records.
+    pub async fn lookup_random(&self) -> Result<Vec<NodeRecord>, Discv4Error> {
+        let target = PeerId::random();
+        self.lookup_node(Some(target)).await
+    }
+
+    /// Sends a message to the service to lookup the closest nodes
+    pub fn send_lookup(&self, node_id: PeerId) {
+        let cmd = Discv4Command::Lookup { node_id: Some(node_id), tx: None };
+        self.send_to_service(cmd);
     }
 
     async fn lookup_node(&self, node_id: Option<PeerId>) -> Result<Vec<NodeRecord>, Discv4Error> {
         let (tx, rx) = oneshot::channel();
         let cmd = Discv4Command::Lookup { node_id, tx: Some(tx) };
-        self.to_service.send(cmd).await?;
+        self.to_service.send(cmd)?;
         Ok(rx.await?)
     }
 
@@ -268,13 +329,13 @@ impl Discv4 {
     /// Removes the peer from the table, if it exists.
     pub fn remove_peer(&self, node_id: PeerId) {
         let cmd = Discv4Command::Remove(node_id);
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
 
     /// Adds the node to the table, if it is not already present.
     pub fn add_node(&self, node_record: NodeRecord) {
         let cmd = Discv4Command::Add(node_record);
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
 
     /// Adds the peer and id to the ban list.
@@ -282,14 +343,15 @@ impl Discv4 {
     /// This will prevent any future inclusion in the table
     pub fn ban(&self, node_id: PeerId, ip: IpAddr) {
         let cmd = Discv4Command::Ban(node_id, ip);
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
+
     /// Adds the ip to the ban list.
     ///
     /// This will prevent any future inclusion in the table
     pub fn ban_ip(&self, ip: IpAddr) {
         let cmd = Discv4Command::BanIp(ip);
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
 
     /// Adds the peer to the ban list.
@@ -297,7 +359,7 @@ impl Discv4 {
     /// This will prevent any future inclusion in the table
     pub fn ban_node(&self, node_id: PeerId) {
         let cmd = Discv4Command::BanPeer(node_id);
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
 
     /// Sets the tcp port
@@ -305,7 +367,7 @@ impl Discv4 {
     /// This will update our [`NodeRecord`]'s tcp port.
     pub fn set_tcp_port(&self, port: u16) {
         let cmd = Discv4Command::SetTcpPort(port);
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
 
     /// Sets the pair in the EIP-868 [`Enr`] of the node.
@@ -315,27 +377,21 @@ impl Discv4 {
     /// CAUTION: The value **must** be rlp encoded
     pub fn set_eip868_rlp_pair(&self, key: Vec<u8>, rlp: Bytes) {
         let cmd = Discv4Command::SetEIP868RLPPair { key, rlp };
-        self.safe_send_to_service(cmd);
+        self.send_to_service(cmd);
     }
 
     /// Sets the pair in the EIP-868 [`Enr`] of the node.
     ///
     /// If the key already exists, this will update it.
-    pub fn set_eip868_rlp(&self, key: Vec<u8>, value: impl reth_rlp::Encodable) {
-        let mut buf = BytesMut::new();
-        value.encode(&mut buf);
-        self.set_eip868_rlp_pair(key, buf.freeze())
+    pub fn set_eip868_rlp(&self, key: Vec<u8>, value: impl alloy_rlp::Encodable) {
+        self.set_eip868_rlp_pair(key, Bytes::from(alloy_rlp::encode(&value)))
     }
 
-    fn safe_send_to_service(&self, cmd: Discv4Command) {
-        // we want this message to always arrive, so we clone the sender
-        let _ = self.to_service.clone().try_send(cmd);
-    }
-
+    #[inline]
     fn send_to_service(&self, cmd: Discv4Command) {
-        let _ = self.to_service.try_send(cmd).map_err(|err| {
+        let _ = self.to_service.send(cmd).map_err(|err| {
             debug!(
-                target : "discv4",
+                target: "discv4",
                 %err,
                 "channel capacity reached, dropping command",
             )
@@ -346,12 +402,20 @@ impl Discv4 {
     pub async fn update_stream(&self) -> Result<ReceiverStream<DiscoveryUpdate>, Discv4Error> {
         let (tx, rx) = oneshot::channel();
         let cmd = Discv4Command::Updates(tx);
-        self.to_service.send(cmd).await?;
+        self.to_service.send(cmd)?;
         Ok(rx.await?)
+    }
+
+    /// Terminates the spawned [Discv4Service].
+    pub fn terminate(&self) {
+        self.send_to_service(Discv4Command::Terminated);
     }
 }
 
 /// Manages discv4 peer discovery over UDP.
+///
+/// This is a [Stream] to handles incoming and outgoing discv4 messages and emits updates via:
+/// [Discv4Service::update_stream].
 #[must_use = "Stream does nothing unless polled"]
 pub struct Discv4Service {
     /// Local address of the UDP socket.
@@ -360,6 +424,8 @@ pub struct Discv4Service {
     local_eip_868_enr: Enr<SecretKey>,
     /// Local ENR of the server.
     local_node_record: NodeRecord,
+    /// Keeps track of the node record of the local node.
+    shared_node_record: Arc<Mutex<NodeRecord>>,
     /// The secret key used to sign payloads
     secret_key: SecretKey,
     /// The UDP socket for sending and receiving messages.
@@ -371,8 +437,12 @@ pub struct Discv4Service {
     /// The routing table.
     kbuckets: KBucketsTable<NodeKey, NodeEntry>,
     /// Receiver for incoming messages
+    ///
+    /// Receives incoming messages from the UDP task.
     ingress: IngressReceiver,
     /// Sender for sending outgoing messages
+    ///
+    /// Sends outgoind messages to the UDP task.
     egress: EgressSender,
     /// Buffered pending pings to apply backpressure.
     ///
@@ -383,15 +453,22 @@ pub struct Discv4Service {
     queued_pings: VecDeque<(NodeRecord, PingReason)>,
     /// Currently active pings to specific nodes.
     pending_pings: HashMap<PeerId, PingRequest>,
+    /// Currently active endpoint proof verification lookups to specific nodes.
+    ///
+    /// Entries here means we've proven the peer's endpoint but haven't completed our end of the
+    /// endpoint proof
+    pending_lookup: HashMap<PeerId, (Instant, LookupContext)>,
     /// Currently active FindNode requests
     pending_find_nodes: HashMap<PeerId, FindNodeRequest>,
     /// Currently active ENR requests
     pending_enr_requests: HashMap<PeerId, EnrRequestState>,
-    /// Commands listener
-    commands_rx: Option<mpsc::Receiver<Discv4Command>>,
+    /// Copy of he sender half of the commands channel for [Discv4]
+    to_service: mpsc::UnboundedSender<Discv4Command>,
+    /// Receiver half of the commands channel for [Discv4]
+    commands_rx: mpsc::UnboundedReceiver<Discv4Command>,
     /// All subscribers for table updates
     update_listeners: Vec<mpsc::Sender<DiscoveryUpdate>>,
-    /// The interval when to trigger lookups
+    /// The interval when to trigger random lookups
     lookup_interval: Interval,
     /// Used to rotate targets to lookup
     lookup_rotator: LookupTargetRotator,
@@ -405,6 +482,10 @@ pub struct Discv4Service {
     config: Discv4Config,
     /// Buffered events populated during poll.
     queued_events: VecDeque<Discv4Event>,
+    /// Keeps track of nodes from which we have received a `Pong` message.
+    received_pongs: PongTable,
+    /// Interval used to expire additionally tracked nodes
+    expire_interval: Interval,
 }
 
 impl Discv4Service {
@@ -415,7 +496,6 @@ impl Discv4Service {
         local_node_record: NodeRecord,
         secret_key: SecretKey,
         config: Discv4Config,
-        commands_rx: Option<mpsc::Receiver<Discv4Command>>,
     ) -> Self {
         let socket = Arc::new(socket);
         let (ingress_tx, ingress_rx) = mpsc::channel(config.udp_ingress_message_buffer);
@@ -458,7 +538,7 @@ impl Discv4Service {
 
         // for EIP-868 construct an ENR
         let local_eip_868_enr = {
-            let mut builder = EnrBuilder::new("v4");
+            let mut builder = Enr::builder();
             builder.ip(local_node_record.address);
             if local_node_record.address.is_ipv4() {
                 builder.udp4(local_node_record.udp_port);
@@ -471,14 +551,18 @@ impl Discv4Service {
             for (key, val) in config.additional_eip868_rlp_pairs.iter() {
                 builder.add_value_rlp(key, val.clone());
             }
-
-            builder.build(&secret_key).expect("v4 is set; qed")
+            builder.build(&secret_key).expect("v4 is set")
         };
+
+        let (to_service, commands_rx) = mpsc::unbounded_channel();
+
+        let shared_node_record = Arc::new(Mutex::new(local_node_record));
 
         Discv4Service {
             local_address,
             local_eip_868_enr,
             local_node_record,
+            shared_node_record,
             _socket: socket,
             kbuckets,
             secret_key,
@@ -487,9 +571,11 @@ impl Discv4Service {
             egress: egress_tx,
             queued_pings: Default::default(),
             pending_pings: Default::default(),
+            pending_lookup: Default::default(),
             pending_find_nodes: Default::default(),
             pending_enr_requests: Default::default(),
             commands_rx,
+            to_service,
             update_listeners: Vec::with_capacity(1),
             lookup_interval: self_lookup_interval,
             ping_interval,
@@ -498,12 +584,23 @@ impl Discv4Service {
             resolve_external_ip_interval: config.resolve_external_ip_interval(),
             config,
             queued_events: Default::default(),
+            received_pongs: Default::default(),
+            expire_interval: tokio::time::interval(EXPIRE_DURATION),
         }
     }
 
-    /// Returns the current enr sequence
+    /// Returns the frontend handle that can communicate with the service via commands.
+    pub fn handle(&self) -> Discv4 {
+        Discv4 {
+            local_addr: self.local_address,
+            to_service: self.to_service.clone(),
+            node_record: self.shared_node_record.clone(),
+        }
+    }
+
+    /// Returns the current enr sequence of the local record.
     fn enr_seq(&self) -> Option<u64> {
-        (self.config.enable_eip868).then(|| self.local_eip_868_enr.seq())
+        self.config.enable_eip868.then(|| self.local_eip_868_enr.seq())
     }
 
     /// Sets the [Interval] used for periodically looking up targets over the network
@@ -515,27 +612,29 @@ impl Discv4Service {
     /// discovery
     pub fn set_external_ip_addr(&mut self, external_ip: IpAddr) {
         if self.local_node_record.address != external_ip {
-            debug!(target : "discv4",  ?external_ip, "Updating external ip");
+            debug!(target: "discv4", ?external_ip, "Updating external ip");
             self.local_node_record.address = external_ip;
             let _ = self.local_eip_868_enr.set_ip(external_ip, &self.secret_key);
-            debug!(target : "discv4", enr=?self.local_eip_868_enr, "Updated local ENR");
+            let mut lock = self.shared_node_record.lock();
+            *lock = self.local_node_record;
+            debug!(target: "discv4", enr=?self.local_eip_868_enr, "Updated local ENR");
         }
     }
 
     /// Returns the [PeerId] that identifies this node
-    pub fn local_peer_id(&self) -> &PeerId {
+    pub const fn local_peer_id(&self) -> &PeerId {
         &self.local_node_record.id
     }
 
     /// Returns the address of the UDP socket
-    pub fn local_addr(&self) -> SocketAddr {
+    pub const fn local_addr(&self) -> SocketAddr {
         self.local_address
     }
 
     /// Returns the ENR of this service.
     ///
     /// Note: this will include the external address if resolved.
-    pub fn local_enr(&self) -> NodeRecord {
+    pub const fn local_enr(&self) -> NodeRecord {
         self.local_node_record
     }
 
@@ -561,13 +660,13 @@ impl Discv4Service {
     /// [`DiscoveryUpdate::Added`] event for the given bootnodes. So boot nodes don't appear in the
     /// update stream, which is usually desirable, since bootnodes should not be connected to.
     ///
-    /// If adding the configured boodnodes should result in a [`DiscoveryUpdate::Added`], see
+    /// If adding the configured bootnodes should result in a [`DiscoveryUpdate::Added`], see
     /// [`Self::add_all_nodes`].
     ///
     /// **Note:** This is a noop if there are no bootnodes.
     pub fn bootstrap(&mut self) {
         for record in self.config.bootstrap_nodes.clone() {
-            debug!(target : "discv4",  ?record, "pinging boot node");
+            debug!(target: "discv4", ?record, "pinging boot node");
             let key = kad_key(record.id);
             let entry = NodeEntry::new(record);
 
@@ -582,7 +681,7 @@ impl Discv4Service {
             ) {
                 InsertResult::Failed(_) => {}
                 _ => {
-                    self.try_ping(record, PingReason::Initial);
+                    self.try_ping(record, PingReason::InitialInsert);
                 }
             }
         }
@@ -596,12 +695,13 @@ impl Discv4Service {
             self.bootstrap();
 
             while let Some(event) = self.next().await {
-                trace!(target : "discv4", ?event,  "processed");
+                trace!(target: "discv4", ?event, "processed");
             }
+            trace!(target: "discv4", "service terminated");
         })
     }
 
-    /// Creates a new channel for [`DiscoveryUpdate`]s
+    /// Creates a new bounded channel for [`DiscoveryUpdate`]s.
     pub fn update_stream(&mut self) -> ReceiverStream<DiscoveryUpdate> {
         let (tx, rx) = mpsc::channel(512);
         self.update_listeners.push(tx);
@@ -635,7 +735,7 @@ impl Discv4Service {
     /// This takes an optional Sender through which all successfully discovered nodes are sent once
     /// the request has finished.
     fn lookup_with(&mut self, target: PeerId, tx: Option<NodeRecordSender>) {
-        trace!(target : "discv4", ?target, "Starting lookup");
+        trace!(target: "discv4", ?target, "Starting lookup");
         let target_key = kad_key(target);
 
         // Start a lookup context with the 16 (MAX_NODES_PER_BUCKET) closest nodes
@@ -664,7 +764,7 @@ impl Discv4Service {
             return
         }
 
-        trace!(target : "discv4", ?target, num = closest.len(), "Start lookup closest nodes");
+        trace!(target: "discv4", ?target, num = closest.len(), "Start lookup closest nodes");
 
         for node in closest {
             self.find_node(&node, ctx.clone());
@@ -675,7 +775,7 @@ impl Discv4Service {
     ///
     /// CAUTION: This expects there's a valid Endpoint proof to the given `node`.
     fn find_node(&mut self, node: &NodeRecord, ctx: LookupContext) {
-        trace!(target : "discv4", ?node, lookup=?ctx.target(),  "Sending FindNode");
+        trace!(target: "discv4", ?node, lookup=?ctx.target(), "Sending FindNode");
         ctx.mark_queried(node.id);
         let id = ctx.target();
         let msg = Message::FindNode(FindNode { id, expire: self.find_node_expiration() });
@@ -683,7 +783,9 @@ impl Discv4Service {
         self.pending_find_nodes.insert(node.id, FindNodeRequest::new(ctx));
     }
 
-    /// Notifies all listeners
+    /// Notifies all listeners.
+    ///
+    /// Removes all listeners that are closed.
     fn notify(&mut self, update: DiscoveryUpdate) {
         self.update_listeners.retain_mut(|listener| match listener.try_send(update.clone()) {
             Ok(()) => true,
@@ -724,7 +826,7 @@ impl Discv4Service {
         let key = kad_key(node_id);
         let removed = self.kbuckets.remove(&key);
         if removed {
-            debug!(target: "discv4", ?node_id, "removed node");
+            trace!(target: "discv4", ?node_id, "removed node");
             self.notify(DiscoveryUpdate::Removed(node_id));
         }
         removed
@@ -733,6 +835,16 @@ impl Discv4Service {
     /// Gets the number of entries that are considered connected.
     pub fn num_connected(&self) -> usize {
         self.kbuckets.buckets_iter().fold(0, |count, bucket| count + bucket.num_connected())
+    }
+
+    /// Check if the peer has a bond
+    fn has_bond(&self, remote_id: PeerId, remote_ip: IpAddr) -> bool {
+        if let Some(timestamp) = self.received_pongs.last_pong(remote_id, remote_ip) {
+            if timestamp.elapsed() < self.config.bond_expiration {
+                return true
+            }
+        }
+        false
     }
 
     /// Update the entry on RE-ping
@@ -766,6 +878,7 @@ impl Discv4Service {
                 }
             }
             (Some(_), None) => {
+                // got an ENR
                 self.send_enr_request(record);
             }
             _ => {}
@@ -796,7 +909,7 @@ impl Discv4Service {
 
                 if !old_status.is_connected() {
                     let _ = entry.update(ConnectionState::Connected, Some(old_status.direction));
-                    debug!(target : "discv4",  ?record, "added after successful endpoint proof");
+                    trace!(target: "discv4", ?record, "added after successful endpoint proof");
                     self.notify(DiscoveryUpdate::Added(record));
 
                     if has_enr_seq {
@@ -813,7 +926,7 @@ impl Discv4Service {
                 if !status.is_connected() {
                     status.state = ConnectionState::Connected;
                     let _ = entry.update(status);
-                    debug!(target : "discv4",  ?record, "added after successful endpoint proof");
+                    trace!(target: "discv4", ?record, "added after successful endpoint proof");
                     self.notify(DiscoveryUpdate::Added(record));
 
                     if has_enr_seq {
@@ -853,24 +966,26 @@ impl Discv4Service {
                     },
                 ) {
                     BucketInsertResult::Inserted | BucketInsertResult::Pending { .. } => {
-                        debug!(target : "discv4",  ?record, "inserted new record");
+                        trace!(target: "discv4", ?record, "inserted new record");
                     }
                     _ => return false,
                 }
             }
             _ => return false,
         }
-        self.try_ping(record, PingReason::Initial);
+
+        // send the initial ping to the _new_ node
+        self.try_ping(record, PingReason::InitialInsert);
         true
     }
 
     /// Encodes the packet, sends it and returns the hash.
-    pub(crate) fn send_packet(&mut self, msg: Message, to: SocketAddr) -> H256 {
+    pub(crate) fn send_packet(&mut self, msg: Message, to: SocketAddr) -> B256 {
         let (payload, hash) = msg.encode(&self.secret_key);
-        trace!(target : "discv4",  r#type=?msg.msg_type(), ?to, ?hash, "sending packet");
+        trace!(target: "discv4", r#type=?msg.msg_type(), ?to, ?hash, "sending packet");
         let _ = self.egress.try_send((payload, to)).map_err(|err| {
             debug!(
-                target : "discv4",
+                target: "discv4",
                 %err,
                 "dropped outgoing packet",
             );
@@ -879,7 +994,7 @@ impl Discv4Service {
     }
 
     /// Message handler for an incoming `Ping`
-    fn on_ping(&mut self, ping: Ping, remote_addr: SocketAddr, remote_id: PeerId, hash: H256) {
+    fn on_ping(&mut self, ping: Ping, remote_addr: SocketAddr, remote_id: PeerId, hash: B256) {
         if self.is_expired(ping.expire) {
             // ping's expiration timestamp is in the past
             return
@@ -903,10 +1018,18 @@ impl Discv4Service {
         // Note: we only mark if the node is absent because the `last 12h` condition is handled by
         // the ping interval
         let mut is_new_insert = false;
+        let mut needs_bond = false;
+        let mut is_proven = false;
 
         let old_enr = match self.kbuckets.entry(&key) {
-            kbucket::Entry::Present(mut entry, _) => entry.value_mut().update_with_enr(ping.enr_sq),
-            kbucket::Entry::Pending(mut entry, _) => entry.value().update_with_enr(ping.enr_sq),
+            kbucket::Entry::Present(mut entry, _) => {
+                is_proven = entry.value().has_endpoint_proof;
+                entry.value_mut().update_with_enr(ping.enr_sq)
+            }
+            kbucket::Entry::Pending(mut entry, _) => {
+                is_proven = entry.value().has_endpoint_proof;
+                entry.value().update_with_enr(ping.enr_sq)
+            }
             kbucket::Entry::Absent(entry) => {
                 let mut node = NodeEntry::new(record);
                 node.last_enr_seq = ping.enr_sq;
@@ -927,14 +1050,15 @@ impl Discv4Service {
                         // we received a ping but the corresponding bucket for the peer is already
                         // full, we can't add any additional peers to that bucket, but we still want
                         // to emit an event that we discovered the node
-                        debug!(target : "discv4",  ?record, "discovered new record but bucket is full");
-                        self.notify(DiscoveryUpdate::DiscoveredAtCapacity(record))
+                        trace!(target: "discv4", ?record, "discovered new record but bucket is full");
+                        self.notify(DiscoveryUpdate::DiscoveredAtCapacity(record));
+                        needs_bond = true;
                     }
-                    BucketInsertResult::FailedFilter |
-                    BucketInsertResult::TooManyIncoming |
-                    BucketInsertResult::NodeExists => {
+                    BucketInsertResult::TooManyIncoming | BucketInsertResult::NodeExists => {
+                        needs_bond = true;
                         // insert unsuccessful but we still want to send the pong
                     }
+                    BucketInsertResult::FailedFilter => return,
                 }
 
                 None
@@ -955,7 +1079,22 @@ impl Discv4Service {
 
         // if node was absent also send a ping to establish the endpoint proof from our end
         if is_new_insert {
-            self.try_ping(record, PingReason::Initial);
+            self.try_ping(record, PingReason::InitialInsert);
+        } else if needs_bond {
+            self.try_ping(record, PingReason::EstablishBond);
+        } else if is_proven {
+            // if node has been proven, this means we've received a pong and verified its endpoint
+            // proof. We've also sent a pong above to verify our endpoint proof, so we can now
+            // send our find_nodes request if PingReason::Lookup
+            if let Some((_, ctx)) = self.pending_lookup.remove(&record.id) {
+                if self.pending_find_nodes.contains_key(&record.id) {
+                    // there's already another pending request, unmark it so the next round can
+                    // try to send it
+                    ctx.unmark_queried(record.id);
+                } else {
+                    self.find_node(&record, ctx);
+                }
+            }
         } else {
             // Request ENR if included in the ping
             match (ping.enr_sq, old_enr) {
@@ -999,7 +1138,7 @@ impl Discv4Service {
     /// Sends a ping message to the node's UDP address.
     ///
     /// Returns the echo hash of the ping message.
-    pub(crate) fn send_ping(&mut self, node: NodeRecord, reason: PingReason) -> H256 {
+    pub(crate) fn send_ping(&mut self, node: NodeRecord, reason: PingReason) -> B256 {
         let remote_addr = node.udp_addr();
         let id = node.id;
         let ping = Ping {
@@ -1008,7 +1147,7 @@ impl Discv4Service {
             expire: self.ping_expiration(),
             enr_sq: self.enr_seq(),
         };
-        trace!(target : "discv4",  ?ping, "sending ping");
+        trace!(target: "discv4", ?ping, "sending ping");
         let echo_hash = self.send_packet(Message::Ping(ping), remote_addr);
 
         self.pending_pings
@@ -1026,7 +1165,7 @@ impl Discv4Service {
         let remote_addr = node.udp_addr();
         let enr_request = EnrRequest { expire: self.enr_request_expiration() };
 
-        trace!(target : "discv4",  ?enr_request, "sending enr request");
+        trace!(target: "discv4", ?enr_request, "sending enr request");
         let echo_hash = self.send_packet(Message::EnrRequest(enr_request), remote_addr);
 
         self.pending_enr_requests
@@ -1044,7 +1183,7 @@ impl Discv4Service {
                 {
                     let request = entry.get();
                     if request.echo_hash != pong.echo {
-                        debug!( target : "discv4",  from=?remote_addr, expected=?request.echo_hash, echo_hash=?pong.echo,"Got unexpected Pong");
+                        trace!(target: "discv4", from=?remote_addr, expected=?request.echo_hash, echo_hash=?pong.echo,"Got unexpected Pong");
                         return
                     }
                 }
@@ -1053,22 +1192,26 @@ impl Discv4Service {
             Entry::Vacant(_) => return,
         };
 
+        // keep track of the pong
+        self.received_pongs.on_pong(remote_id, remote_addr.ip());
+
         match reason {
-            PingReason::Initial => {
+            PingReason::InitialInsert => {
                 self.update_on_pong(node, pong.enr_sq);
+            }
+            PingReason::EstablishBond => {
+                // nothing to do here
             }
             PingReason::RePing => {
                 self.update_on_reping(node, pong.enr_sq);
             }
             PingReason::Lookup(node, ctx) => {
                 self.update_on_pong(node, pong.enr_sq);
-                if self.pending_find_nodes.contains_key(&node.id) {
-                    // there's already another pending request, unmark it so the next round can try
-                    // to send it
-                    ctx.unmark_queried(node.id);
-                } else {
-                    self.find_node(&node, ctx);
-                }
+                // insert node and assoc. lookup_context into the pending_lookup table to complete
+                // our side of the endpoint proof verification.
+                // Start the lookup timer here - and evict accordingly. Note that this is a separate
+                // timer than the ping_request timer.
+                self.pending_lookup.insert(node.id, (Instant::now(), ctx));
             }
         }
     }
@@ -1076,34 +1219,22 @@ impl Discv4Service {
     /// Handler for an incoming `FindNode` message
     fn on_find_node(&mut self, msg: FindNode, remote_addr: SocketAddr, node_id: PeerId) {
         if self.is_expired(msg.expire) {
-            // ping's expiration timestamp is in the past
+            // expiration timestamp is in the past
+            return
+        }
+        if node_id == *self.local_peer_id() {
+            // ignore find node requests to ourselves
             return
         }
 
-        let key = kad_key(node_id);
-
-        match self.kbuckets.entry(&key) {
-            kbucket::Entry::Present(_, status) => {
-                if status.is_connected() {
-                    self.respond_closest(msg.id, remote_addr)
-                }
-            }
-            kbucket::Entry::Pending(_, status) => {
-                if status.is_connected() {
-                    self.respond_closest(msg.id, remote_addr)
-                }
-            }
-            kbucket::Entry::Absent(_) => {
-                // no existing endpoint proof
-                // > To guard against traffic amplification attacks, Neighbors replies should only be sent if the sender of FindNode has been verified by the endpoint proof procedure.
-            }
-            kbucket::Entry::SelfEntry => {}
+        if self.has_bond(node_id, remote_addr.ip()) {
+            self.respond_closest(msg.id, remote_addr)
         }
     }
 
     /// Handler for incoming `EnrResponse` message
     fn on_enr_response(&mut self, msg: EnrResponse, remote_addr: SocketAddr, id: PeerId) {
-        trace!(target : "discv4", ?remote_addr, ?msg, "received ENR response");
+        trace!(target: "discv4", ?remote_addr, ?msg, "received ENR response");
         if let Some(resp) = self.pending_enr_requests.remove(&id) {
             if resp.echo_hash == msg.request_hash {
                 let key = kad_key(id);
@@ -1138,14 +1269,13 @@ impl Discv4Service {
         msg: EnrRequest,
         remote_addr: SocketAddr,
         id: PeerId,
-        request_hash: H256,
+        request_hash: B256,
     ) {
         if !self.config.enable_eip868 || self.is_expired(msg.expire) {
             return
         }
 
-        let key = kad_key(id);
-        if let BucketEntry::Present(_, _) = self.kbuckets.entry(&key) {
+        if self.has_bond(id, remote_addr.ip()) {
             self.send_packet(
                 Message::EnrResponse(EnrResponse {
                     request_hash,
@@ -1176,7 +1306,7 @@ impl Discv4Service {
                     if total <= MAX_NODES_PER_BUCKET {
                         request.response_count = total;
                     } else {
-                        debug!(target : "discv4", total, from=?remote_addr,  "Received neighbors packet entries exceeds max nodes per bucket");
+                        trace!(target: "discv4", total, from=?remote_addr, "Received neighbors packet entries exceeds max nodes per bucket");
                         return
                     }
                 };
@@ -1192,13 +1322,13 @@ impl Discv4Service {
             }
             Entry::Vacant(_) => {
                 // received neighbours response without requesting it
-                debug!( target : "discv4", from=?remote_addr, "Received unsolicited Neighbours");
+                trace!(target: "discv4", from=?remote_addr, "Received unsolicited Neighbours");
                 return
             }
         };
 
         // This is the recursive lookup step where we initiate new FindNode requests for new nodes
-        // that where discovered.
+        // that were discovered.
         for node in msg.nodes.into_iter().map(NodeRecord::into_ipv4_mapped) {
             // prevent banned peers from being added to the context
             if self.config.ban_list.is_banned(&node.id, &node.address) {
@@ -1218,7 +1348,8 @@ impl Discv4Service {
             match self.kbuckets.entry(&key) {
                 BucketEntry::Absent(entry) => {
                     // the node's endpoint is not proven yet, so we need to ping it first, on
-                    // success, it will initiate a `FindNode` request.
+                    // success, we will add the node to the pending_lookup table, and wait to send
+                    // back a Pong before initiating a FindNode request.
                     // In order to prevent that this node is selected again on subsequent responses,
                     // while the ping is still active, we always mark it as queried.
                     ctx.mark_queried(closest.id);
@@ -1253,11 +1384,14 @@ impl Discv4Service {
     fn respond_closest(&mut self, target: PeerId, to: SocketAddr) {
         let key = kad_key(target);
         let expire = self.send_neighbours_expiration();
-        let all_nodes = self.kbuckets.closest_values(&key).collect::<Vec<_>>();
 
-        for nodes in all_nodes.chunks(SAFE_MAX_DATAGRAM_NEIGHBOUR_RECORDS) {
+        // get the MAX_NODES_PER_BUCKET closest nodes to the target
+        let closest_nodes =
+            self.kbuckets.closest_values(&key).take(MAX_NODES_PER_BUCKET).collect::<Vec<_>>();
+
+        for nodes in closest_nodes.chunks(SAFE_MAX_DATAGRAM_NEIGHBOUR_RECORDS) {
             let nodes = nodes.iter().map(|node| node.value.record).collect::<Vec<NodeRecord>>();
-            trace!( target : "discv4",  len = nodes.len(), to=?to,"Sent neighbours packet");
+            trace!(target: "discv4", len = nodes.len(), to=?to,"Sent neighbours packet");
             let msg = Message::Neighbours(Neighbours { nodes, expire });
             self.send_packet(msg, to);
         }
@@ -1265,7 +1399,7 @@ impl Discv4Service {
 
     fn evict_expired_requests(&mut self, now: Instant) {
         self.pending_enr_requests.retain(|_node_id, enr_request| {
-            now.duration_since(enr_request.sent_at) < self.config.ping_expiration
+            now.duration_since(enr_request.sent_at) < self.config.enr_expiration
         });
 
         let mut failed_pings = Vec::new();
@@ -1277,10 +1411,25 @@ impl Discv4Service {
             true
         });
 
-        debug!(target: "discv4", num=%failed_pings.len(), "evicting nodes due to failed pong");
+        trace!(target: "discv4", num=%failed_pings.len(), "evicting nodes due to failed pong");
 
         // remove nodes that failed to pong
         for node_id in failed_pings {
+            self.remove_node(node_id);
+        }
+
+        let mut failed_lookups = Vec::new();
+        self.pending_lookup.retain(|node_id, (lookup_sent_at, _)| {
+            if now.duration_since(*lookup_sent_at) > self.config.ping_expiration {
+                failed_lookups.push(*node_id);
+                return false
+            }
+            true
+        });
+        trace!(target: "discv4", num=%failed_lookups.len(), "evicting nodes due to failed lookup");
+
+        // remove nodes that failed the e2e lookup process, so we can restart it
+        for node_id in failed_lookups {
             self.remove_node(node_id);
         }
 
@@ -1302,7 +1451,7 @@ impl Discv4Service {
             true
         });
 
-        debug!(target: "discv4", num=%failed_neighbours.len(), "processing failed neighbours");
+        trace!(target: "discv4", num=%failed_neighbours.len(), "processing failed neighbours");
 
         for node_id in failed_neighbours {
             let key = kad_key(node_id);
@@ -1371,7 +1520,7 @@ impl Discv4Service {
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if self.config.enforce_expiration_timestamps && timestamp < now {
-            debug!(target: "discv4", "Expired packet");
+            trace!(target: "discv4", "Expired packet");
             return Err(())
         }
         Ok(())
@@ -1420,15 +1569,15 @@ impl Discv4Service {
             }
 
             // trigger self lookup
-            if self.config.enable_lookup && self.lookup_interval.poll_tick(cx).is_ready() {
-                let _ = self.lookup_interval.poll_tick(cx);
-                let target = self.lookup_rotator.next(&self.local_node_record.id);
-                self.lookup_with(target, None);
+            if self.config.enable_lookup {
+                while self.lookup_interval.poll_tick(cx).is_ready() {
+                    let target = self.lookup_rotator.next(&self.local_node_record.id);
+                    self.lookup_with(target, None);
+                }
             }
 
             // re-ping some peers
-            if self.ping_interval.poll_tick(cx).is_ready() {
-                let _ = self.ping_interval.poll_tick(cx);
+            while self.ping_interval.poll_tick(cx).is_ready() {
                 self.re_ping_oldest();
             }
 
@@ -1438,75 +1587,70 @@ impl Discv4Service {
                 self.set_external_ip_addr(ip);
             }
 
-            // process all incoming commands
-            if let Some(mut rx) = self.commands_rx.take() {
-                let mut is_done = false;
-                while let Poll::Ready(cmd) = rx.poll_recv(cx) {
-                    if let Some(cmd) = cmd {
-                        match cmd {
-                            Discv4Command::Add(enr) => {
-                                self.add_node(enr);
-                            }
-                            Discv4Command::Lookup { node_id, tx } => {
-                                let node_id = node_id.unwrap_or(self.local_node_record.id);
-                                self.lookup_with(node_id, tx);
-                            }
-                            Discv4Command::SetLookupInterval(duration) => {
-                                self.set_lookup_interval(duration);
-                            }
-                            Discv4Command::Updates(tx) => {
-                                let rx = self.update_stream();
-                                let _ = tx.send(rx);
-                            }
-                            Discv4Command::BanPeer(node_id) => self.ban_node(node_id),
-                            Discv4Command::Remove(node_id) => {
-                                self.remove_node(node_id);
-                            }
-                            Discv4Command::Ban(node_id, ip) => {
-                                self.ban_node(node_id);
-                                self.ban_ip(ip);
-                            }
-                            Discv4Command::BanIp(ip) => {
-                                self.ban_ip(ip);
-                            }
-                            Discv4Command::SetEIP868RLPPair { key, rlp } => {
-                                debug!(target: "discv4", key=%String::from_utf8_lossy(&key), "Update EIP-868 extension pair");
+            // drain all incoming `Discv4` commands, this channel can never close
+            while let Poll::Ready(Some(cmd)) = self.commands_rx.poll_recv(cx) {
+                match cmd {
+                    Discv4Command::Add(enr) => {
+                        self.add_node(enr);
+                    }
+                    Discv4Command::Lookup { node_id, tx } => {
+                        let node_id = node_id.unwrap_or(self.local_node_record.id);
+                        self.lookup_with(node_id, tx);
+                    }
+                    Discv4Command::SetLookupInterval(duration) => {
+                        self.set_lookup_interval(duration);
+                    }
+                    Discv4Command::Updates(tx) => {
+                        let rx = self.update_stream();
+                        let _ = tx.send(rx);
+                    }
+                    Discv4Command::BanPeer(node_id) => self.ban_node(node_id),
+                    Discv4Command::Remove(node_id) => {
+                        self.remove_node(node_id);
+                    }
+                    Discv4Command::Ban(node_id, ip) => {
+                        self.ban_node(node_id);
+                        self.ban_ip(ip);
+                    }
+                    Discv4Command::BanIp(ip) => {
+                        self.ban_ip(ip);
+                    }
+                    Discv4Command::SetEIP868RLPPair { key, rlp } => {
+                        debug!(target: "discv4", key=%String::from_utf8_lossy(&key), "Update EIP-868 extension pair");
 
-                                let _ = self.local_eip_868_enr.insert_raw_rlp(
-                                    key,
-                                    rlp,
-                                    &self.secret_key,
-                                );
-                            }
-                            Discv4Command::SetTcpPort(port) => {
-                                debug!(target: "discv4", %port, "Update tcp port");
-                                self.local_node_record.tcp_port = port;
-                                if self.local_node_record.address.is_ipv4() {
-                                    let _ = self.local_eip_868_enr.set_tcp4(port, &self.secret_key);
-                                } else {
-                                    let _ = self.local_eip_868_enr.set_tcp6(port, &self.secret_key);
-                                }
-                            }
+                        let _ = self.local_eip_868_enr.insert_raw_rlp(key, rlp, &self.secret_key);
+                    }
+                    Discv4Command::SetTcpPort(port) => {
+                        debug!(target: "discv4", %port, "Update tcp port");
+                        self.local_node_record.tcp_port = port;
+                        if self.local_node_record.address.is_ipv4() {
+                            let _ = self.local_eip_868_enr.set_tcp4(port, &self.secret_key);
+                        } else {
+                            let _ = self.local_eip_868_enr.set_tcp6(port, &self.secret_key);
                         }
-                    } else {
-                        is_done = true;
-                        break
+                    }
+
+                    Discv4Command::Terminated => {
+                        // terminate the service
+                        self.queued_events.push_back(Discv4Event::Terminated);
                     }
                 }
-                if !is_done {
-                    self.commands_rx = Some(rx);
-                }
             }
+
+            // restricts how many messages we process in a single poll before yielding back control
+            let mut udp_message_budget = UDP_MESSAGE_POLL_LOOP_BUDGET;
 
             // process all incoming datagrams
             while let Poll::Ready(Some(event)) = self.ingress.poll_recv(cx) {
                 match event {
-                    IngressEvent::RecvError(_) => {}
+                    IngressEvent::RecvError(err) => {
+                        debug!(target: "discv4", %err, "failed to read datagram");
+                    }
                     IngressEvent::BadPacket(from, err, data) => {
-                        debug!(target : "discv4", ?from, ?err, packet=?hex::encode(&data),   "bad packet");
+                        trace!(target: "discv4", ?from, %err, packet=?hex::encode(&data), "bad packet");
                     }
                     IngressEvent::Packet(remote_addr, Packet { msg, node_id, hash }) => {
-                        trace!( target : "discv4",  r#type=?msg.msg_type(), from=?remote_addr,"received packet");
+                        trace!(target: "discv4", r#type=?msg.msg_type(), from=?remote_addr,"received packet");
                         let event = match msg {
                             Message::Ping(ping) => {
                                 self.on_ping(ping, remote_addr, node_id, hash);
@@ -1537,14 +1681,30 @@ impl Discv4Service {
                         self.queued_events.push_back(event);
                     }
                 }
+
+                udp_message_budget -= 1;
+                if udp_message_budget < 0 {
+                    trace!(target: "discv4", budget=UDP_MESSAGE_POLL_LOOP_BUDGET, "exhausted message poll budget");
+                    if self.queued_events.is_empty() {
+                        // we've exceeded the message budget and have no events to process
+                        // this will make sure we're woken up again
+                        cx.waker().wake_by_ref();
+                    }
+                    break
+                }
             }
 
             // try resending buffered pings
             self.ping_buffered();
 
+            // evict expired requests
+            while self.evict_expired_requests_interval.poll_tick(cx).is_ready() {
+                self.evict_expired_requests(Instant::now());
+            }
+
             // evict expired nodes
-            if self.evict_expired_requests_interval.poll_tick(cx).is_ready() {
-                self.evict_expired_requests(Instant::now())
+            while self.expire_interval.poll_tick(cx).is_ready() {
+                self.received_pongs.evict_expired(Instant::now(), EXPIRE_DURATION);
             }
 
             if self.queued_events.is_empty() {
@@ -1559,7 +1719,27 @@ impl Stream for Discv4Service {
     type Item = Discv4Event;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Some(ready!(self.get_mut().poll(cx))))
+        // Poll the internal poll method
+        match ready!(self.get_mut().poll(cx)) {
+            // if the service is terminated, return None to terminate the stream
+            Discv4Event::Terminated => Poll::Ready(None),
+            // For any other event, return Poll::Ready(Some(event))
+            ev => Poll::Ready(Some(ev)),
+        }
+    }
+}
+
+impl fmt::Debug for Discv4Service {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Discv4Service")
+            .field("local_address", &self.local_address)
+            .field("local_peer_id", &self.local_peer_id())
+            .field("local_node_record", &self.local_node_record)
+            .field("queued_pings", &self.queued_pings)
+            .field("pending_lookup", &self.pending_lookup)
+            .field("pending_find_nodes", &self.pending_find_nodes)
+            .field("lookup_interval", &self.lookup_interval)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1580,6 +1760,8 @@ pub enum Discv4Event {
     EnrRequest,
     /// A `EnrResponse` message was handled.
     EnrResponse,
+    /// Service is being terminated
+    Terminated,
 }
 
 /// Continuously reads new messages from the channel and writes them to the socket
@@ -1588,10 +1770,10 @@ pub(crate) async fn send_loop(udp: Arc<UdpSocket>, rx: EgressReceiver) {
     while let Some((payload, to)) = stream.next().await {
         match udp.send_to(&payload, to).await {
             Ok(size) => {
-                trace!( target : "discv4",  ?to, ?size,"sent payload");
+                trace!(target: "discv4", ?to, ?size,"sent payload");
             }
             Err(err) => {
-                debug!( target : "discv4",  ?to, ?err,"Failed to send datagram.");
+                debug!(target: "discv4", ?to, %err,"Failed to send datagram.");
             }
         }
     }
@@ -1602,19 +1784,19 @@ pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_i
     let send = |event: IngressEvent| async {
         let _ = tx.send(event).await.map_err(|err| {
             debug!(
-                target : "discv4",
+                target: "discv4",
                  %err,
                 "failed send incoming packet",
             )
         });
     };
 
+    let mut buf = [0; MAX_PACKET_SIZE];
     loop {
-        let mut buf = [0; MAX_PACKET_SIZE];
         let res = udp.recv_from(&mut buf).await;
         match res {
             Err(err) => {
-                debug!(target : "discv4",  ?err, "Failed to read datagram.");
+                debug!(target: "discv4", %err, "Failed to read datagram.");
                 send(IngressEvent::RecvError(err)).await;
             }
             Ok((read, remote_addr)) => {
@@ -1623,13 +1805,13 @@ pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_i
                     Ok(packet) => {
                         if packet.node_id == local_id {
                             // received our own message
-                            debug!(target : "discv4", ?remote_addr,  "Received own packet.");
+                            debug!(target: "discv4", ?remote_addr, "Received own packet.");
                             continue
                         }
                         send(IngressEvent::Packet(remote_addr, packet)).await;
                     }
                     Err(err) => {
-                        debug!( target : "discv4",  ?err,"Failed to decode packet");
+                        trace!(target: "discv4", %err,"Failed to decode packet");
                         send(IngressEvent::BadPacket(remote_addr, err, packet.to_vec())).await
                     }
                 }
@@ -1638,7 +1820,7 @@ pub(crate) async fn receive_loop(udp: Arc<UdpSocket>, tx: IngressSender, local_i
     }
 }
 
-/// The commands sent from the frontend to the service
+/// The commands sent from the frontend [Discv4] to the service [Discv4Service].
 enum Discv4Command {
     Add(NodeRecord),
     SetTcpPort(u16),
@@ -1650,9 +1832,11 @@ enum Discv4Command {
     Lookup { node_id: Option<PeerId>, tx: Option<NodeRecordSender> },
     SetLookupInterval(Duration),
     Updates(OneshotSender<ReceiverStream<DiscoveryUpdate>>),
+    Terminated,
 }
 
 /// Event type receiver produces
+#[derive(Debug)]
 pub(crate) enum IngressEvent {
     /// Encountered an error when reading a datagram message.
     RecvError(io::Error),
@@ -1663,13 +1847,14 @@ pub(crate) enum IngressEvent {
 }
 
 /// Tracks a sent ping
+#[derive(Debug)]
 struct PingRequest {
     // Timestamp when the request was sent.
     sent_at: Instant,
     // Node to which the request was sent.
     node: NodeRecord,
     // Hash sent in the Ping request
-    echo_hash: H256,
+    echo_hash: B256,
     /// Why this ping was sent.
     reason: PingReason,
 }
@@ -1716,8 +1901,9 @@ impl LookupTargetRotator {
 
 /// Tracks lookups across multiple `FindNode` requests.
 ///
-/// If this type is dropped by all
-#[derive(Clone)]
+/// If this type is dropped by all Clones, it will send all the discovered nodes to the listener, if
+/// one is present.
+#[derive(Clone, Debug)]
 struct LookupContext {
     inner: Rc<LookupContextInner>,
 }
@@ -1820,13 +2006,16 @@ impl LookupContext {
 // guaranteed that there's only 1 owner ([`Discv4Service`]) of all possible [`Rc`] clones of
 // [`LookupContext`].
 unsafe impl Send for LookupContext {}
-
+#[derive(Debug)]
 struct LookupContextInner {
     /// The target to lookup.
     target: discv5::Key<NodeKey>,
     /// The closest nodes
     closest_nodes: RefCell<BTreeMap<Distance, QueryNode>>,
     /// A listener for all the nodes retrieved in this lookup
+    ///
+    /// This is present if the lookup was triggered manually via [Discv4] and we want to return all
+    /// the nodes once the lookup finishes.
     listener: Option<NodeRecordSender>,
 }
 
@@ -1855,6 +2044,7 @@ struct QueryNode {
     responded: bool,
 }
 
+#[derive(Debug)]
 struct FindNodeRequest {
     // Timestamp when the request was sent.
     sent_at: Instant,
@@ -1874,11 +2064,12 @@ impl FindNodeRequest {
     }
 }
 
+#[derive(Debug)]
 struct EnrRequestState {
     // Timestamp when the request was sent.
     sent_at: Instant,
     // Hash sent in the Ping request
-    echo_hash: H256,
+    echo_hash: B256,
 }
 
 /// Stored node info.
@@ -1892,9 +2083,9 @@ struct NodeEntry {
     last_enr_seq: Option<u64>,
     /// ForkId if retrieved via ENR requests.
     fork_id: Option<ForkId>,
-    /// Counter for failed findNode requests
+    /// Counter for failed findNode requests.
     find_node_failures: usize,
-    /// whether the endpoint of the peer is proven
+    /// Whether the endpoint of the peer is proven.
     has_endpoint_proof: bool,
 }
 
@@ -1955,12 +2146,16 @@ impl NodeEntry {
 }
 
 /// Represents why a ping is issued
+#[derive(Debug)]
 enum PingReason {
-    /// Initial ping to a previously unknown peer.
-    Initial,
-    /// Re-ping a peer..
+    /// Initial ping to a previously unknown peer that was inserted into the table.
+    InitialInsert,
+    /// Initial ping to a previously unknown peer that didn't fit into the table. But we still want
+    /// to establish a bond.
+    EstablishBond,
+    /// Re-ping a peer.
     RePing,
-    /// Part of a lookup to ensure endpoint is proven.
+    /// Part of a lookup to ensure endpoint is proven before we can send a FindNode request.
     Lookup(NodeRecord, LookupContext),
 }
 
@@ -2003,10 +2198,10 @@ impl From<ForkId> for EnrForkIdEntry {
 mod tests {
     use super::*;
     use crate::test_utils::{create_discv4, create_discv4_with_config, rng_endpoint, rng_record};
+    use alloy_rlp::{Decodable, Encodable};
     use rand::{thread_rng, Rng};
-    use reth_primitives::{hex_literal::hex, mainnet_nodes, ForkHash};
-    use reth_rlp::{Decodable, Encodable};
-    use std::{future::poll_fn, net::Ipv4Addr};
+    use reth_primitives::{hex, mainnet_nodes, ForkHash};
+    use std::future::poll_fn;
 
     #[tokio::test]
     async fn test_configured_enr_forkid_entry() {
@@ -2073,19 +2268,35 @@ mod tests {
         let local_addr = service.local_addr();
 
         let mut num_inserted = 0;
-        for _ in 0..MAX_NODES_PING {
+        loop {
             let node = NodeRecord::new(local_addr, PeerId::random());
             if service.add_node(node) {
                 num_inserted += 1;
                 assert!(service.pending_pings.contains_key(&node.id));
                 assert_eq!(service.pending_pings.len(), num_inserted);
+                if num_inserted == MAX_NODES_PING {
+                    break;
+                }
+            }
+        }
+
+        // `pending_pings` is full, insert into `queued_pings`.
+        num_inserted = 0;
+        for _ in 0..MAX_NODES_PING {
+            let node = NodeRecord::new(local_addr, PeerId::random());
+            if service.add_node(node) {
+                num_inserted += 1;
+                assert!(!service.pending_pings.contains_key(&node.id));
+                assert_eq!(service.pending_pings.len(), MAX_NODES_PING);
+                assert_eq!(service.queued_pings.len(), num_inserted);
             }
         }
     }
 
-    #[tokio::test]
+    // Bootstraps with mainnet boot nodes
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn test_lookup() {
+    async fn test_mainnet_lookup() {
         reth_tracing::init_test_tracing();
         let fork_id = ForkId { hash: ForkHash(hex!("743f3d89")), next: 16191202 };
 
@@ -2128,7 +2339,7 @@ mod tests {
 
         let v4: Ipv4Addr = "0.0.0.0".parse().unwrap();
         let v6 = v4.to_ipv6_mapped();
-        let addr: SocketAddr = (v6, 30303).into();
+        let addr: SocketAddr = (v6, DEFAULT_DISCOVERY_PORT).into();
 
         let ping = Ping {
             from: rng_endpoint(&mut rng),
@@ -2137,8 +2348,8 @@ mod tests {
             enr_sq: Some(rng.gen()),
         };
 
-        let id = PeerId::random();
-        service.on_ping(ping, addr, id, H256::random());
+        let id = PeerId::random_with(&mut rng);
+        service.on_ping(ping, addr, id, rng.gen());
 
         let key = kad_key(id);
         match service.kbuckets.entry(&key) {
@@ -2160,7 +2371,7 @@ mod tests {
 
         let v4: Ipv4Addr = "0.0.0.0".parse().unwrap();
         let v6 = v4.to_ipv6_mapped();
-        let addr: SocketAddr = (v6, 30303).into();
+        let addr: SocketAddr = (v6, DEFAULT_DISCOVERY_PORT).into();
 
         let ping = Ping {
             from: rng_endpoint(&mut rng),
@@ -2169,8 +2380,8 @@ mod tests {
             enr_sq: Some(rng.gen()),
         };
 
-        let id = PeerId::random();
-        service.on_ping(ping, addr, id, H256::random());
+        let id = PeerId::random_with(&mut rng);
+        service.on_ping(ping, addr, id, rng.gen());
 
         let key = kad_key(id);
         match service.kbuckets.entry(&key) {
@@ -2184,7 +2395,7 @@ mod tests {
         reth_tracing::init_test_tracing();
 
         let config = Discv4Config::builder().build();
-        let (_discv4, mut service) = create_discv4_with_config(config).await;
+        let (_discv4, mut service) = create_discv4_with_config(config.clone()).await;
 
         let id = PeerId::random();
         let key = kad_key(id);
@@ -2208,7 +2419,64 @@ mod tests {
 
             Poll::Ready(())
         })
-        .await
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_on_neighbours_recursive_lookup() {
+        reth_tracing::init_test_tracing();
+
+        let config = Discv4Config::builder().build();
+        let (_discv4, mut service) = create_discv4_with_config(config.clone()).await;
+        let (_discv4, mut service2) = create_discv4_with_config(config).await;
+
+        let id = PeerId::random();
+        let key = kad_key(id);
+        let record = NodeRecord::new("0.0.0.0:0".parse().unwrap(), id);
+
+        let _ = service.kbuckets.insert_or_update(
+            &key,
+            NodeEntry::new_proven(record),
+            NodeStatus {
+                direction: ConnectionDirection::Incoming,
+                state: ConnectionState::Connected,
+            },
+        );
+        // Needed in this test to populate self.pending_find_nodes for as a prereq to a valid
+        // on_neighbours request
+        service.lookup_self();
+        assert_eq!(service.pending_find_nodes.len(), 1);
+
+        poll_fn(|cx| {
+            let _ = service.poll(cx);
+            assert_eq!(service.pending_find_nodes.len(), 1);
+
+            Poll::Ready(())
+        })
+        .await;
+
+        let expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() +
+            10000000000000;
+        let msg = Neighbours { nodes: vec![service2.local_node_record], expire: expiry };
+        service.on_neighbours(msg, record.tcp_addr(), id);
+        // wait for the processed ping
+        let event = poll_fn(|cx| service2.poll(cx)).await;
+        assert_eq!(event, Discv4Event::Ping);
+        // assert that no find_node req has been added here on top of the initial one, since both
+        // sides of the endpoint proof is not completed here
+        assert_eq!(service.pending_find_nodes.len(), 1);
+        // we now wait for PONG
+        let event = poll_fn(|cx| service.poll(cx)).await;
+        assert_eq!(event, Discv4Event::Pong);
+        // Ideally we want to assert against service.pending_lookup.len() here - but because the
+        // service2 sends Pong and Ping consecutivley on_ping(), the pending_lookup table gets
+        // drained almost immediately - and no way to grab the handle to its intermediary state here
+        // :(
+        let event = poll_fn(|cx| service.poll(cx)).await;
+        assert_eq!(event, Discv4Event::Ping);
+        // assert that we've added the find_node req here after both sides of the endpoint proof is
+        // done
+        assert_eq!(service.pending_find_nodes.len(), 2);
     }
 
     #[tokio::test]
@@ -2292,6 +2560,71 @@ mod tests {
         let _ = discv4.lookup_self().await;
     }
 
+    #[tokio::test]
+    async fn test_requests_timeout() {
+        reth_tracing::init_test_tracing();
+        let fork_id = ForkId { hash: ForkHash(hex!("743f3d89")), next: 16191202 };
+
+        let config = Discv4Config::builder()
+            .request_timeout(Duration::from_millis(200))
+            .ping_expiration(Duration::from_millis(200))
+            .add_eip868_pair("eth", fork_id)
+            .build();
+        let (_disv4, mut service) = create_discv4_with_config(config).await;
+
+        let id = PeerId::random();
+        let key = kad_key(id);
+        let record = NodeRecord::new("0.0.0.0:0".parse().unwrap(), id);
+
+        let _ = service.kbuckets.insert_or_update(
+            &key,
+            NodeEntry::new_proven(record),
+            NodeStatus {
+                direction: ConnectionDirection::Incoming,
+                state: ConnectionState::Connected,
+            },
+        );
+
+        service.lookup_self();
+        assert_eq!(service.pending_find_nodes.len(), 1);
+
+        let ctx = service.pending_find_nodes.values().next().unwrap().lookup_context.clone();
+
+        service.pending_lookup.insert(record.id, (Instant::now(), ctx));
+
+        assert_eq!(service.pending_lookup.len(), 1);
+
+        let ping = Ping {
+            from: service.local_node_record.into(),
+            to: record.into(),
+            expire: service.ping_expiration(),
+            enr_sq: service.enr_seq(),
+        };
+        let echo_hash = service.send_packet(Message::Ping(ping), record.udp_addr());
+        let ping_request = PingRequest {
+            sent_at: Instant::now(),
+            node: record,
+            echo_hash,
+            reason: PingReason::InitialInsert,
+        };
+        service.pending_pings.insert(record.id, ping_request);
+
+        assert_eq!(service.pending_pings.len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        poll_fn(|cx| {
+            let _ = service.poll(cx);
+
+            assert_eq!(service.pending_find_nodes.len(), 0);
+            assert_eq!(service.pending_lookup.len(), 0);
+            assert_eq!(service.pending_pings.len(), 0);
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
     // sends a PING packet with wrong 'to' field and expects a PONG response.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_check_wrong_to() {
@@ -2315,7 +2648,7 @@ mod tests {
             sent_at: Instant::now(),
             node: service_2.local_node_record,
             echo_hash,
-            reason: PingReason::Initial,
+            reason: PingReason::InitialInsert,
         };
         service_1.pending_pings.insert(*service_2.local_peer_id(), ping_request);
 
@@ -2375,14 +2708,12 @@ mod tests {
         // we now wait for PONG
         let event = poll_fn(|cx| service_2.poll(cx)).await;
 
-        // Since the endpoint was already proven from 1 POV it can already send a FindNode so the
-        // next event is either the PONG or Find Node
         match event {
-            Discv4Event::FindNode | Discv4Event::EnrRequest => {
+            Discv4Event::EnrRequest => {
                 // since we support enr in the ping it may also request the enr
                 let event = poll_fn(|cx| service_2.poll(cx)).await;
                 match event {
-                    Discv4Event::FindNode | Discv4Event::EnrRequest => {
+                    Discv4Event::EnrRequest => {
                         let event = poll_fn(|cx| service_2.poll(cx)).await;
                         assert_eq!(event, Discv4Event::Pong);
                     }

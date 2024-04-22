@@ -1,149 +1,190 @@
 //! Common CLI utility functions.
 
+use boyer_moore_magiclen::BMByte;
 use eyre::Result;
-use reth_consensus_common::validation::validate_block_standalone;
 use reth_db::{
-    cursor::DbCursorRO,
+    cursor::{DbCursorRO, DbDupCursorRO},
     database::Database,
-    table::Table,
+    table::{Decode, Decompress, DupSort, Table, TableRow},
     transaction::{DbTx, DbTxMut},
+    DatabaseError, RawTable, TableRawRow,
 };
-use reth_interfaces::p2p::{
-    bodies::client::BodiesClient,
-    headers::client::{HeadersClient, HeadersRequest},
-    priority::Priority,
-};
-use reth_primitives::{
-    fs, BlockHashOrNumber, ChainSpec, HeadersDirection, SealedBlock, SealedHeader,
-};
-use std::{
-    env::VarError,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use reth_primitives::{fs, ChainSpec};
+use reth_provider::ProviderFactory;
+use std::{path::Path, rc::Rc, sync::Arc};
 use tracing::info;
 
-/// Get a single header from network
-pub async fn get_single_header<Client>(
-    client: Client,
-    id: BlockHashOrNumber,
-) -> Result<SealedHeader>
-where
-    Client: HeadersClient,
-{
-    let request = HeadersRequest { direction: HeadersDirection::Rising, limit: 1, start: id };
-
-    let (peer_id, response) =
-        client.get_headers_with_priority(request, Priority::High).await?.split();
-
-    if response.len() != 1 {
-        client.report_bad_message(peer_id);
-        eyre::bail!("Invalid number of headers received. Expected: 1. Received: {}", response.len())
-    }
-
-    let header = response.into_iter().next().unwrap().seal_slow();
-
-    let valid = match id {
-        BlockHashOrNumber::Hash(hash) => header.hash() == hash,
-        BlockHashOrNumber::Number(number) => header.number == number,
-    };
-
-    if !valid {
-        client.report_bad_message(peer_id);
-        eyre::bail!(
-            "Received invalid header. Received: {:?}. Expected: {:?}",
-            header.num_hash(),
-            id
-        );
-    }
-
-    Ok(header)
+/// Exposing `open_db_read_only` function
+pub mod db {
+    pub use reth_db::open_db_read_only;
 }
 
-/// Get a body from network based on header
-pub async fn get_single_body<Client>(
-    client: Client,
-    chain_spec: Arc<ChainSpec>,
-    header: SealedHeader,
-) -> Result<SealedBlock>
-where
-    Client: BodiesClient,
-{
-    let (peer_id, response) = client.get_block_body(header.hash).await?.split();
-
-    if response.is_none() {
-        client.report_bad_message(peer_id);
-        eyre::bail!("Invalid number of bodies received. Expected: 1. Received: 0")
-    }
-
-    let block = response.unwrap();
-    let block = SealedBlock {
-        header,
-        body: block.transactions,
-        ommers: block.ommers,
-        withdrawals: block.withdrawals,
-    };
-
-    validate_block_standalone(&block, &chain_spec)?;
-
-    Ok(block)
-}
+/// Re-exported from `reth_node_core`, also to prevent a breaking change. See the comment on
+/// the `reth_node_core::args` re-export for more details.
+pub use reth_node_core::utils::*;
 
 /// Wrapper over DB that implements many useful DB queries.
-pub struct DbTool<'a, DB: Database> {
-    pub(crate) db: &'a DB,
-    pub(crate) chain: Arc<ChainSpec>,
+#[derive(Debug)]
+pub struct DbTool<DB: Database> {
+    /// The provider factory that the db tool will use.
+    pub provider_factory: ProviderFactory<DB>,
+    /// The [ChainSpec] that the db tool will use.
+    pub chain: Arc<ChainSpec>,
 }
 
-impl<'a, DB: Database> DbTool<'a, DB> {
+impl<DB: Database> DbTool<DB> {
     /// Takes a DB where the tables have already been created.
-    pub(crate) fn new(db: &'a DB, chain: Arc<ChainSpec>) -> eyre::Result<Self> {
-        Ok(Self { db, chain })
+    pub fn new(provider_factory: ProviderFactory<DB>, chain: Arc<ChainSpec>) -> eyre::Result<Self> {
+        Ok(Self { provider_factory, chain })
     }
 
     /// Grabs the contents of the table within a certain index range and places the
     /// entries into a [`HashMap`][std::collections::HashMap].
-    pub fn list<T: Table>(
-        &self,
-        skip: usize,
-        len: usize,
-        reverse: bool,
-    ) -> Result<Vec<(T::Key, T::Value)>> {
-        let data = self.db.view(|tx| {
-            let mut cursor = tx.cursor_read::<T>().expect("Was not able to obtain a cursor.");
+    ///
+    /// [`ListFilter`] can be used to further
+    /// filter down the desired results. (eg. List only rows which include `0xd3adbeef`)
+    pub fn list<T: Table>(&self, filter: &ListFilter) -> Result<(Vec<TableRow<T>>, usize)> {
+        let bmb = Rc::new(BMByte::from(&filter.search));
+        if bmb.is_none() && filter.has_search() {
+            eyre::bail!("Invalid search.")
+        }
 
-            if reverse {
-                cursor.walk_back(None)?.skip(skip).take(len).collect::<Result<_, _>>()
+        let mut hits = 0;
+
+        let data = self.provider_factory.db_ref().view(|tx| {
+            let mut cursor =
+                tx.cursor_read::<RawTable<T>>().expect("Was not able to obtain a cursor.");
+
+            let map_filter = |row: Result<TableRawRow<T>, _>| {
+                if let Ok((k, v)) = row {
+                    let (key, value) = (k.into_key(), v.into_value());
+
+                    if key.len() + value.len() < filter.min_row_size {
+                        return None
+                    }
+                    if key.len() < filter.min_key_size {
+                        return None
+                    }
+                    if value.len() < filter.min_value_size {
+                        return None
+                    }
+
+                    let result = || {
+                        if filter.only_count {
+                            return None
+                        }
+                        Some((
+                            <T as Table>::Key::decode(&key).unwrap(),
+                            <T as Table>::Value::decompress(&value).unwrap(),
+                        ))
+                    };
+
+                    match &*bmb {
+                        Some(searcher) => {
+                            if searcher.find_first_in(&value).is_some() ||
+                                searcher.find_first_in(&key).is_some()
+                            {
+                                hits += 1;
+                                return result()
+                            }
+                        }
+                        None => {
+                            hits += 1;
+                            return result()
+                        }
+                    }
+                }
+                None
+            };
+
+            if filter.reverse {
+                Ok(cursor
+                    .walk_back(None)?
+                    .skip(filter.skip)
+                    .filter_map(map_filter)
+                    .take(filter.len)
+                    .collect::<Vec<(_, _)>>())
             } else {
-                cursor.walk(None)?.skip(skip).take(len).collect::<Result<_, _>>()
+                Ok(cursor
+                    .walk(None)?
+                    .skip(filter.skip)
+                    .filter_map(map_filter)
+                    .take(filter.len)
+                    .collect::<Vec<(_, _)>>())
             }
         })?;
 
-        data.map_err(|e| eyre::eyre!(e))
+        Ok((data.map_err(|e: DatabaseError| eyre::eyre!(e))?, hits))
     }
 
     /// Grabs the content of the table for the given key
     pub fn get<T: Table>(&self, key: T::Key) -> Result<Option<T::Value>> {
-        self.db.view(|tx| tx.get::<T>(key))?.map_err(|e| eyre::eyre!(e))
+        self.provider_factory.db_ref().view(|tx| tx.get::<T>(key))?.map_err(|e| eyre::eyre!(e))
     }
 
-    /// Drops the database at the given path.
-    pub fn drop(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        info!(target: "reth::cli", "Dropping database at {:?}", path);
-        fs::remove_dir_all(path)?;
+    /// Grabs the content of the DupSort table for the given key and subkey
+    pub fn get_dup<T: DupSort>(&self, key: T::Key, subkey: T::SubKey) -> Result<Option<T::Value>> {
+        self.provider_factory
+            .db_ref()
+            .view(|tx| tx.cursor_dup_read::<T>()?.seek_by_key_subkey(key, subkey))?
+            .map_err(|e| eyre::eyre!(e))
+    }
+
+    /// Drops the database and the static files at the given path.
+    pub fn drop(
+        &mut self,
+        db_path: impl AsRef<Path>,
+        static_files_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let db_path = db_path.as_ref();
+        info!(target: "reth::cli", "Dropping database at {:?}", db_path);
+        fs::remove_dir_all(db_path)?;
+
+        let static_files_path = static_files_path.as_ref();
+        info!(target: "reth::cli", "Dropping static files at {:?}", static_files_path);
+        fs::remove_dir_all(static_files_path)?;
+        fs::create_dir_all(static_files_path)?;
+
         Ok(())
     }
 
     /// Drops the provided table from the database.
     pub fn drop_table<T: Table>(&mut self) -> Result<()> {
-        self.db.update(|tx| tx.clear::<T>())??;
+        self.provider_factory.db_ref().update(|tx| tx.clear::<T>())??;
         Ok(())
     }
 }
 
-/// Parses a user-specified path with support for environment variables and common shorthands (e.g.
-/// ~ for the user's home directory).
-pub fn parse_path(value: &str) -> Result<PathBuf, shellexpand::LookupError<VarError>> {
-    shellexpand::full(value).map(|path| PathBuf::from(path.into_owned()))
+/// Filters the results coming from the database.
+#[derive(Debug)]
+pub struct ListFilter {
+    /// Skip first N entries.
+    pub skip: usize,
+    /// Take N entries.
+    pub len: usize,
+    /// Sequence of bytes that will be searched on values and keys from the database.
+    pub search: Vec<u8>,
+    /// Minimum row size.
+    pub min_row_size: usize,
+    /// Minimum key size.
+    pub min_key_size: usize,
+    /// Minimum value size.
+    pub min_value_size: usize,
+    /// Reverse order of entries.
+    pub reverse: bool,
+    /// Only counts the number of filtered entries without decoding and returning them.
+    pub only_count: bool,
+}
+
+impl ListFilter {
+    /// If `search` has a list of bytes, then filter for rows that have this sequence.
+    pub fn has_search(&self) -> bool {
+        !self.search.is_empty()
+    }
+
+    /// Updates the page with new `skip` and `len` values.
+    pub fn update_page(&mut self, skip: usize, len: usize) {
+        self.skip = skip;
+        self.len = len;
+    }
 }

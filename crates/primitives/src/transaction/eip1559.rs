@@ -1,5 +1,7 @@
 use super::access_list::AccessList;
-use crate::{Bytes, ChainId, TransactionKind};
+use crate::{keccak256, Bytes, ChainId, Signature, TransactionKind, TxType, B256, U256};
+use alloy_rlp::{length_of_length, Decodable, Encodable, Header};
+use bytes::BytesMut;
 use reth_codecs::{main_codec, Compact};
 use std::mem;
 
@@ -8,7 +10,7 @@ use std::mem;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct TxEip1559 {
     /// Added as EIP-pub 155: Simple replay attack protection
-    pub chain_id: u64,
+    pub chain_id: ChainId,
     /// A scalar value equal to the number of transactions sent by the sender; formally Tn.
     pub nonce: u64,
     /// A scalar value equal to the maximum
@@ -44,11 +46,7 @@ pub struct TxEip1559 {
     /// be transferred to the message call’s recipient or,
     /// in the case of contract creation, as an endowment
     /// to the newly created account; formally Tv.
-    ///
-    /// As ethereum circulation is around 120mil eth as of 2022 that is around
-    /// 120000000000000000000000000 wei we are safe to use u128 as its max number is:
-    /// 340282366920938463463374607431768211455
-    pub value: u128,
+    pub value: U256,
     /// The accessList specifies a list of addresses and storage keys;
     /// these addresses and storage keys are added into the `accessed_addresses`
     /// and `accessed_storage_keys` global sets (introduced in EIP-2929).
@@ -82,6 +80,105 @@ impl TxEip1559 {
         }
     }
 
+    /// Decodes the inner [TxEip1559] fields from RLP bytes.
+    ///
+    /// NOTE: This assumes a RLP header has already been decoded, and _just_ decodes the following
+    /// RLP fields in the following order:
+    ///
+    /// - `chain_id`
+    /// - `nonce`
+    /// - `max_priority_fee_per_gas`
+    /// - `max_fee_per_gas`
+    /// - `gas_limit`
+    /// - `to`
+    /// - `value`
+    /// - `data` (`input`)
+    /// - `access_list`
+    pub(crate) fn decode_inner(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        Ok(Self {
+            chain_id: Decodable::decode(buf)?,
+            nonce: Decodable::decode(buf)?,
+            max_priority_fee_per_gas: Decodable::decode(buf)?,
+            max_fee_per_gas: Decodable::decode(buf)?,
+            gas_limit: Decodable::decode(buf)?,
+            to: Decodable::decode(buf)?,
+            value: Decodable::decode(buf)?,
+            input: Decodable::decode(buf)?,
+            access_list: Decodable::decode(buf)?,
+        })
+    }
+
+    /// Encodes only the transaction's fields into the desired buffer, without a RLP header.
+    pub(crate) fn fields_len(&self) -> usize {
+        self.chain_id.length() +
+            self.nonce.length() +
+            self.max_priority_fee_per_gas.length() +
+            self.max_fee_per_gas.length() +
+            self.gas_limit.length() +
+            self.to.length() +
+            self.value.length() +
+            self.input.0.length() +
+            self.access_list.length()
+    }
+
+    /// Encodes only the transaction's fields into the desired buffer, without a RLP header.
+    pub(crate) fn encode_fields(&self, out: &mut dyn bytes::BufMut) {
+        self.chain_id.encode(out);
+        self.nonce.encode(out);
+        self.max_priority_fee_per_gas.encode(out);
+        self.max_fee_per_gas.encode(out);
+        self.gas_limit.encode(out);
+        self.to.encode(out);
+        self.value.encode(out);
+        self.input.0.encode(out);
+        self.access_list.encode(out);
+    }
+
+    /// Inner encoding function that is used for both rlp [`Encodable`] trait and for calculating
+    /// hash that for eip2718 does not require rlp header
+    ///
+    /// This encodes the transaction as:
+    /// `rlp(chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit to, value, input,
+    /// access_list, y_parity, r, s)`
+    pub(crate) fn encode_with_signature(
+        &self,
+        signature: &Signature,
+        out: &mut dyn bytes::BufMut,
+        with_header: bool,
+    ) {
+        let payload_length = self.fields_len() + signature.payload_len();
+        if with_header {
+            Header {
+                list: false,
+                payload_length: 1 + length_of_length(payload_length) + payload_length,
+            }
+            .encode(out);
+        }
+        out.put_u8(self.tx_type() as u8);
+        let header = Header { list: true, payload_length };
+        header.encode(out);
+        self.encode_fields(out);
+        signature.encode(out);
+    }
+
+    /// Output the length of the RLP signed transaction encoding, _without_ a RLP string header.
+    pub(crate) fn payload_len_with_signature_without_header(&self, signature: &Signature) -> usize {
+        let payload_length = self.fields_len() + signature.payload_len();
+        // 'transaction type byte length' + 'header length' + 'payload length'
+        1 + length_of_length(payload_length) + payload_length
+    }
+
+    /// Output the length of the RLP signed transaction encoding. This encodes with a RLP header.
+    pub(crate) fn payload_len_with_signature(&self, signature: &Signature) -> usize {
+        let len = self.payload_len_with_signature_without_header(signature);
+        length_of_length(len) + len
+    }
+
+    /// Get transaction type
+    pub(crate) fn tx_type(&self) -> TxType {
+        TxType::Eip1559
+    }
+
     /// Calculates a heuristic for the in-memory size of the [TxEip1559] transaction.
     #[inline]
     pub fn size(&self) -> usize {
@@ -91,9 +188,37 @@ impl TxEip1559 {
         mem::size_of::<u128>() + // max_fee_per_gas
         mem::size_of::<u128>() + // max_priority_fee_per_gas
         self.to.size() + // to
-        mem::size_of::<u128>() + // value
+        mem::size_of::<U256>() + // value
         self.access_list.size() + // access_list
         self.input.len() // input
+    }
+
+    /// Encodes the legacy transaction in RLP for signing.
+    ///
+    /// This encodes the transaction as:
+    /// `tx_type || rlp(chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, to,
+    /// value, input, access_list)`
+    ///
+    /// Note that there is no rlp header before the transaction type byte.
+    pub(crate) fn encode_for_signing(&self, out: &mut dyn bytes::BufMut) {
+        out.put_u8(self.tx_type() as u8);
+        Header { list: true, payload_length: self.fields_len() }.encode(out);
+        self.encode_fields(out);
+    }
+
+    /// Outputs the length of the signature RLP encoding for the transaction.
+    pub(crate) fn payload_len_for_signature(&self) -> usize {
+        let payload_length = self.fields_len();
+        // 'transaction type byte length' + 'header length' + 'payload length'
+        1 + length_of_length(payload_length) + payload_length
+    }
+
+    /// Outputs the signature hash of the transaction by first encoding without a signature, then
+    /// hashing.
+    pub(crate) fn signature_hash(&self) -> B256 {
+        let mut buf = BytesMut::with_capacity(self.payload_len_for_signature());
+        self.encode_for_signing(&mut buf);
+        keccak256(&buf)
     }
 }
 
@@ -102,7 +227,7 @@ mod tests {
     use super::TxEip1559;
     use crate::{
         transaction::{signature::Signature, TransactionKind},
-        AccessList, Address, Transaction, TransactionSigned, H256, U256,
+        AccessList, Address, Transaction, TransactionSigned, B256, U256,
     };
     use std::str::FromStr;
 
@@ -111,7 +236,7 @@ mod tests {
         use crate::hex_literal::hex;
 
         let signer: Address = hex!("dd6b8b3dc6b7ad97db52f08a275ff4483e024cea").into();
-        let hash: H256 =
+        let hash: B256 =
             hex!("0ec0b6a2df4d87424e5f6ad2a654e27aaeb7dac20ae9e8385cc09087ad532ee0").into();
 
         let tx = Transaction::Eip1559( TxEip1559 {
@@ -119,7 +244,7 @@ mod tests {
             nonce: 0x42,
             gas_limit: 44386,
             to: TransactionKind::Call( hex!("6069a6c32cf691f5982febae4faf8a6f3ab2f0f6").into()),
-            value: 0,
+            value: U256::ZERO,
             input:  hex!("a22cb4650000000000000000000000005eee75727d804a2b13038928d36f8b188945a57a0000000000000000000000000000000000000000000000000000000000000000").into(),
             max_fee_per_gas: 0x4a817c800,
             max_priority_fee_per_gas: 0x3b9aca00,

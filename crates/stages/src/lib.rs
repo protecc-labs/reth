@@ -1,16 +1,3 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
-    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
-    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
-)]
-#![warn(missing_debug_implementations, missing_docs, unreachable_pub)]
-#![deny(unused_must_use, rust_2018_idioms)]
-#![doc(test(
-    no_crate_inject,
-    attr(deny(warnings, rust_2018_idioms), allow(dead_code, unused_variables))
-))]
-#![allow(clippy::result_large_err)]
 //! Staged syncing primitives for reth.
 //!
 //! This crate contains the syncing primitives [`Pipeline`] and [`Stage`], as well as all stages
@@ -26,48 +13,70 @@
 //!
 //! ```
 //! # use std::sync::Arc;
-//! # use reth_db::test_utils::create_test_rw_db;
 //! # use reth_downloaders::bodies::bodies::BodiesDownloaderBuilder;
 //! # use reth_downloaders::headers::reverse_headers::ReverseHeadersDownloaderBuilder;
 //! # use reth_interfaces::consensus::Consensus;
 //! # use reth_interfaces::test_utils::{TestBodiesClient, TestConsensus, TestHeadersClient};
-//! # use reth_revm::Factory;
-//! # use reth_primitives::{PeerId, MAINNET, H256};
+//! # use reth_revm::EvmProcessorFactory;
+//! # use reth_primitives::{PeerId, MAINNET, B256, PruneModes};
 //! # use reth_stages::Pipeline;
 //! # use reth_stages::sets::DefaultStages;
-//! # use reth_stages::stages::HeaderSyncMode;
 //! # use tokio::sync::watch;
+//! # use reth_evm_ethereum::EthEvmConfig;
+//! # use reth_provider::ProviderFactory;
+//! # use reth_provider::HeaderSyncMode;
+//! # use reth_provider::test_utils::create_test_provider_factory;
+//! # use reth_static_file::StaticFileProducer;
+//! # use reth_config::config::EtlConfig;
+//! #
+//! # let chain_spec = MAINNET.clone();
 //! # let consensus: Arc<dyn Consensus> = Arc::new(TestConsensus::default());
 //! # let headers_downloader = ReverseHeadersDownloaderBuilder::default().build(
 //! #    Arc::new(TestHeadersClient::default()),
 //! #    consensus.clone()
 //! # );
-//! # let db = create_test_rw_db();
+//! # let provider_factory = create_test_provider_factory();
 //! # let bodies_downloader = BodiesDownloaderBuilder::default().build(
-//! #    Arc::new(TestBodiesClient { responder: |_| Ok((PeerId::zero(), vec![]).into()) }),
+//! #    Arc::new(TestBodiesClient { responder: |_| Ok((PeerId::ZERO, vec![]).into()) }),
 //! #    consensus.clone(),
-//! #    db.clone()
+//! #    provider_factory.clone()
 //! # );
-//! # let (tip_tx, tip_rx) = watch::channel(H256::default());
-//! # let factory = Factory::new(MAINNET.clone());
+//! # let (tip_tx, tip_rx) = watch::channel(B256::default());
+//! # let executor_factory = EvmProcessorFactory::new(chain_spec.clone(), EthEvmConfig::default());
+//! # let static_file_producer = StaticFileProducer::new(
+//! #    provider_factory.clone(),
+//! #    provider_factory.static_file_provider(),
+//! #    PruneModes::default()
+//! # );
 //! // Create a pipeline that can fully sync
 //! # let pipeline =
 //! Pipeline::builder()
 //!     .with_tip_sender(tip_tx)
 //!     .add_stages(
-//!         DefaultStages::new(HeaderSyncMode::Tip(tip_rx), consensus, headers_downloader, bodies_downloader, factory)
+//!         DefaultStages::new(
+//!             provider_factory.clone(),
+//!             HeaderSyncMode::Tip(tip_rx),
+//!             consensus,
+//!             headers_downloader,
+//!             bodies_downloader,
+//!             executor_factory,
+//!             EtlConfig::default(),
+//!         )
 //!     )
-//!     .build(db, MAINNET.clone());
+//!     .build(provider_factory, static_file_producer);
 //! ```
 //!
 //! ## Feature Flags
 //!
 //! - `test-utils`: Export utilities for testing
-mod error;
-mod metrics;
-mod pipeline;
-mod stage;
-mod util;
+
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
+    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
+    issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
+)]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 #[allow(missing_docs)]
 #[cfg(any(test, feature = "test-utils"))]
@@ -81,7 +90,5 @@ pub mod stages;
 
 pub mod sets;
 
-pub use error::*;
-pub use metrics::*;
-pub use pipeline::*;
-pub use stage::*;
+// re-export the stages API
+pub use reth_stages_api::*;

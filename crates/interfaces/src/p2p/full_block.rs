@@ -9,7 +9,7 @@ use crate::{
 };
 use futures::Stream;
 use reth_primitives::{
-    BlockBody, Header, HeadersDirection, SealedBlock, SealedHeader, WithPeerId, H256,
+    BlockBody, GotExpected, Header, HeadersDirection, SealedBlock, SealedHeader, WithPeerId, B256,
 };
 use std::{
     cmp::Reverse,
@@ -36,7 +36,7 @@ impl<Client> FullBlockClient<Client> {
     }
 
     /// Returns a client with Test consensus
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn test_client(client: Client) -> Self {
         Self::new(client, Arc::new(crate::test_utils::TestConsensus::default()))
     }
@@ -52,7 +52,7 @@ where
     ///
     /// Caution: This does no validation of body (transactions) response but guarantees that the
     /// [SealedHeader] matches the requested hash.
-    pub fn get_full_block(&self, hash: H256) -> FetchFullBlockFuture<Client> {
+    pub fn get_full_block(&self, hash: B256) -> FetchFullBlockFuture<Client> {
         let client = self.client.clone();
         FetchFullBlockFuture {
             hash,
@@ -77,16 +77,10 @@ where
     /// The returned future yields bodies in falling order, i.e. with descending block numbers.
     pub fn get_full_block_range(
         &self,
-        hash: H256,
+        hash: B256,
         count: u64,
     ) -> FetchFullBlockRangeFuture<Client> {
         let client = self.client.clone();
-
-        // Optimization: if we only want one block, we don't need to wait for the headers request
-        // to complete, and can send the block bodies request right away.
-        let bodies_request =
-            if count == 1 { None } else { Some(client.get_block_bodies(vec![hash])) };
-
         FetchFullBlockRangeFuture {
             start_hash: hash,
             count,
@@ -96,7 +90,7 @@ where
                     limit: count,
                     direction: HeadersDirection::Falling,
                 })),
-                bodies: bodies_request,
+                bodies: None,
             },
             client,
             headers: None,
@@ -117,7 +111,7 @@ where
     Client: BodiesClient + HeadersClient,
 {
     client: Client,
-    hash: H256,
+    hash: B256,
     request: FullBlockRequest<Client>,
     header: Option<SealedHeader>,
     body: Option<BodyResponse>,
@@ -128,7 +122,7 @@ where
     Client: BodiesClient + HeadersClient,
 {
     /// Returns the hash of the block being requested.
-    pub fn hash(&self) -> &H256 {
+    pub fn hash(&self) -> &B256 {
         &self.hash
     }
 
@@ -150,7 +144,7 @@ where
             BodyResponse::PendingValidation(resp) => {
                 // ensure the block is valid, else retry
                 if let Err(err) = ensure_valid_body_response(&header, resp.data()) {
-                    debug!(target: "downloaders", ?err,  hash=?header.hash, "Received wrong body");
+                    debug!(target: "downloaders", %err, hash=?header.hash(), "Received wrong body");
                     self.client.report_bad_message(resp.peer_id());
                     self.header = Some(header);
                     self.request.body = Some(self.client.get_block_body(self.hash));
@@ -164,7 +158,7 @@ where
     fn on_block_response(&mut self, resp: WithPeerId<BlockBody>) {
         if let Some(ref header) = self.header {
             if let Err(err) = ensure_valid_body_response(header, resp.data()) {
-                debug!(target: "downloaders", ?err,  hash=?header.hash, "Received wrong body");
+                debug!(target: "downloaders", %err, hash=?header.hash(), "Received wrong body");
                 self.client.report_bad_message(resp.peer_id());
                 return
             }
@@ -193,7 +187,7 @@ where
                                 maybe_header.map(|h| h.map(|h| h.seal_slow())).split();
                             if let Some(header) = maybe_header {
                                 if header.hash() != this.hash {
-                                    debug!(target: "downloaders", expected=?this.hash, received=?header.hash, "Received wrong header");
+                                    debug!(target: "downloaders", expected=?this.hash, received=?header.hash(), "Received wrong header");
                                     // received a different header than requested
                                     this.client.report_bad_message(peer)
                                 } else {
@@ -306,30 +300,30 @@ fn ensure_valid_body_response(
     header: &SealedHeader,
     block: &BlockBody,
 ) -> Result<(), ConsensusError> {
-    let body_roots = block.calculate_roots();
-
-    if header.ommers_hash != body_roots.ommers_hash {
-        return Err(ConsensusError::BodyOmmersHashDiff {
-            got: body_roots.ommers_hash,
-            expected: header.ommers_hash,
-        })
+    let ommers_hash = block.calculate_ommers_root();
+    if header.ommers_hash != ommers_hash {
+        return Err(ConsensusError::BodyOmmersHashDiff(
+            GotExpected { got: ommers_hash, expected: header.ommers_hash }.into(),
+        ))
     }
 
-    if header.transactions_root != body_roots.tx_root {
-        return Err(ConsensusError::BodyTransactionRootDiff {
-            got: body_roots.tx_root,
-            expected: header.transactions_root,
-        })
+    let tx_root = block.calculate_tx_root();
+    if header.transactions_root != tx_root {
+        return Err(ConsensusError::BodyTransactionRootDiff(
+            GotExpected { got: tx_root, expected: header.transactions_root }.into(),
+        ))
     }
 
-    let withdrawals = block.withdrawals.as_deref().unwrap_or(&[]);
+    let withdrawals = match &block.withdrawals {
+        Some(withdrawals) => withdrawals.as_slice(),
+        None => &[][..],
+    };
     if let Some(header_withdrawals_root) = header.withdrawals_root {
         let withdrawals_root = reth_primitives::proofs::calculate_withdrawals_root(withdrawals);
         if withdrawals_root != header_withdrawals_root {
-            return Err(ConsensusError::BodyWithdrawalsRootDiff {
-                got: withdrawals_root,
-                expected: header_withdrawals_root,
-            })
+            return Err(ConsensusError::BodyWithdrawalsRootDiff(
+                GotExpected { got: withdrawals_root, expected: header_withdrawals_root }.into(),
+            ))
         }
         return Ok(())
     }
@@ -354,6 +348,7 @@ fn ensure_valid_body_response(
 /// NOTE: this assumes that bodies responses are returned by the client in the same order as the
 /// hash array used to request them.
 #[must_use = "futures do nothing unless polled"]
+#[allow(missing_debug_implementations)]
 pub struct FetchFullBlockRangeFuture<Client>
 where
     Client: BodiesClient + HeadersClient,
@@ -363,7 +358,7 @@ where
     /// The consensus instance used to validate the blocks.
     consensus: Arc<dyn Consensus>,
     /// The block hash to start fetching from (inclusive).
-    start_hash: H256,
+    start_hash: B256,
     /// How many blocks to fetch: `len([start_hash, ..]) == count`
     count: u64,
     /// Requests for headers and bodies that are in progress.
@@ -381,7 +376,7 @@ where
     Client: BodiesClient + HeadersClient,
 {
     /// Returns the block hashes for the given range, if they are available.
-    pub fn range_block_hashes(&self) -> Option<Vec<H256>> {
+    pub fn range_block_hashes(&self) -> Option<Vec<B256>> {
         self.headers.as_ref().map(|h| h.iter().map(|h| h.hash()).collect::<Vec<_>>())
     }
 
@@ -408,8 +403,8 @@ where
 
     /// Returns the remaining hashes for the bodies request, based on the headers that still exist
     /// in the `root_map`.
-    fn remaining_bodies_hashes(&self) -> Vec<H256> {
-        self.pending_headers.iter().map(|h| h.hash()).collect::<Vec<_>>()
+    fn remaining_bodies_hashes(&self) -> Vec<B256> {
+        self.pending_headers.iter().map(|h| h.hash()).collect()
     }
 
     /// Returns the [SealedBlock]s if the request is complete and valid.
@@ -427,7 +422,7 @@ where
 
         let headers = self.headers.take()?;
         let mut needs_retry = false;
-        let mut response = Vec::new();
+        let mut valid_responses = Vec::new();
 
         for header in &headers {
             if let Some(body_resp) = self.bodies.remove(header) {
@@ -437,26 +432,27 @@ where
                     BodyResponse::PendingValidation(resp) => {
                         // ensure the block is valid, else retry
                         if let Err(err) = ensure_valid_body_response(header, resp.data()) {
-                            debug!(target: "downloaders", ?err,  hash=?header.hash, "Received wrong body in range response");
+                            debug!(target: "downloaders", %err, hash=?header.hash(), "Received wrong body in range response");
                             self.client.report_bad_message(resp.peer_id());
 
-                            // get body that doesn't match, put back into vecdeque, and just retry
+                            // get body that doesn't match, put back into vecdeque, and retry it
                             self.pending_headers.push_back(header.clone());
                             needs_retry = true;
+                            continue
                         }
 
                         resp.into_data()
                     }
                 };
 
-                response.push(SealedBlock::new(header.clone(), body));
+                valid_responses.push(SealedBlock::new(header.clone(), body));
             }
         }
 
         if needs_retry {
             // put response hashes back into bodies map since we aren't returning them as a
             // response
-            for block in response {
+            for block in valid_responses {
                 let (header, body) = block.split_header_body();
                 self.bodies.insert(header, BodyResponse::Validated(body));
             }
@@ -470,7 +466,7 @@ where
             return None
         }
 
-        Some(response)
+        Some(valid_responses)
     }
 
     fn on_headers_response(&mut self, headers: WithPeerId<Vec<Header>>) {
@@ -520,7 +516,7 @@ where
     }
 
     /// Returns the start hash for the request
-    pub fn start_hash(&self) -> H256 {
+    pub fn start_hash(&self) -> B256 {
         self.start_hash
     }
 
@@ -604,8 +600,8 @@ where
                         // future, and one which is a bodies range future.
                         //
                         // The headers range future should yield the bodies range future.
-                        // The bodies range future should not have an Option<Vec<H256>>, it should
-                        // have a populated Vec<H256> from the successful headers range future.
+                        // The bodies range future should not have an Option<Vec<B256>>, it should
+                        // have a populated Vec<B256> from the successful headers range future.
                         //
                         // This is optimal because we can not send a bodies request without
                         // first completing the headers request. This way we can get rid of the
@@ -732,6 +728,8 @@ enum RangeResponseResult {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
     use crate::test_utils::TestFullBlockClient;
     use futures::StreamExt;
@@ -761,18 +759,30 @@ mod tests {
         assert_eq!(*received, SealedBlock::new(header, body));
     }
 
+    /// Inserts headers and returns the last header and block body.
+    fn insert_headers_into_client(
+        client: &TestFullBlockClient,
+        range: Range<usize>,
+    ) -> (SealedHeader, BlockBody) {
+        let mut sealed_header = SealedHeader::default();
+        let body = BlockBody::default();
+        for _ in range {
+            let (mut header, hash) = sealed_header.split();
+            // update to the next header
+            header.parent_hash = hash;
+            header.number += 1;
+
+            sealed_header = header.seal_slow();
+            client.insert(sealed_header.clone(), body.clone());
+        }
+
+        (sealed_header, body)
+    }
+
     #[tokio::test]
     async fn download_full_block_range() {
         let client = TestFullBlockClient::default();
-        let mut header = SealedHeader::default();
-        let body = BlockBody::default();
-        client.insert(header.clone(), body.clone());
-        for _ in 0..10 {
-            header.parent_hash = header.hash_slow();
-            header.number += 1;
-            header = header.header.seal_slow();
-            client.insert(header.clone(), body.clone());
-        }
+        let (header, body) = insert_headers_into_client(&client, 0..50);
         let client = FullBlockClient::test_client(client);
 
         let received = client.get_full_block_range(header.hash(), 1).await;
@@ -790,15 +800,7 @@ mod tests {
     #[tokio::test]
     async fn download_full_block_range_stream() {
         let client = TestFullBlockClient::default();
-        let mut header = SealedHeader::default();
-        let body = BlockBody::default();
-        client.insert(header.clone(), body.clone());
-        for _ in 0..10 {
-            header.parent_hash = header.hash_slow();
-            header.number += 1;
-            header = header.header.seal_slow();
-            client.insert(header.clone(), body.clone());
-        }
+        let (header, body) = insert_headers_into_client(&client, 0..50);
         let client = FullBlockClient::test_client(client);
 
         let future = client.get_full_block_range(header.hash(), 1);
@@ -836,15 +838,7 @@ mod tests {
     async fn download_full_block_range_over_soft_limit() {
         // default soft limit is 20, so we will request 50 blocks
         let client = TestFullBlockClient::default();
-        let mut header = SealedHeader::default();
-        let body = BlockBody::default();
-        client.insert(header.clone(), body.clone());
-        for _ in 0..50 {
-            header.parent_hash = header.hash_slow();
-            header.number += 1;
-            header = header.header.seal_slow();
-            client.insert(header.clone(), body.clone());
-        }
+        let (header, body) = insert_headers_into_client(&client, 0..50);
         let client = FullBlockClient::test_client(client);
 
         let received = client.get_full_block_range(header.hash(), 1).await;

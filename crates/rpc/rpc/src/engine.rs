@@ -1,10 +1,10 @@
 use jsonrpsee::core::RpcResult as Result;
-use reth_primitives::{Address, BlockId, BlockNumberOrTag, Bytes, H256, U256, U64};
+use reth_primitives::{Address, BlockId, BlockNumberOrTag, Bytes, B256, U256, U64};
 use reth_rpc_api::{EngineEthApiServer, EthApiServer, EthFilterApiServer};
 /// Re-export for convenience
 pub use reth_rpc_engine_api::EngineApi;
 use reth_rpc_types::{
-    state::StateOverride, BlockOverrides, CallRequest, Filter, Log, RichBlock, SyncStatus,
+    state::StateOverride, BlockOverrides, Filter, Log, RichBlock, SyncStatus, TransactionRequest,
 };
 use tracing_futures::Instrument;
 
@@ -59,7 +59,7 @@ where
     /// Handler for: `eth_call`
     async fn call(
         &self,
-        request: CallRequest,
+        request: TransactionRequest,
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
@@ -76,7 +76,7 @@ where
     }
 
     /// Handler for: `eth_getBlockByHash`
-    async fn block_by_hash(&self, hash: H256, full: bool) -> Result<Option<RichBlock>> {
+    async fn block_by_hash(&self, hash: B256, full: bool) -> Result<Option<RichBlock>> {
         self.eth.block_by_hash(hash, full).instrument(engine_span!()).await
     }
 
@@ -90,7 +90,7 @@ where
     }
 
     /// Handler for: `eth_sendRawTransaction`
-    async fn send_raw_transaction(&self, bytes: Bytes) -> Result<H256> {
+    async fn send_raw_transaction(&self, bytes: Bytes) -> Result<B256> {
         self.eth.send_raw_transaction(bytes).instrument(engine_span!()).await
     }
 

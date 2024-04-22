@@ -1,97 +1,48 @@
-use crate::{
-    prune::PrunePartError, serde_helper::deserialize_opt_prune_mode_with_min_blocks, BlockNumber,
-    PruneMode, PrunePart,
-};
-use paste::paste;
-use serde::{Deserialize, Serialize};
+use crate::{PruneMode, ReceiptsLogPruneConfig};
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// Pruning configuration for every part of the data that can be pruned.
-#[derive(Debug, Clone, Default, Copy, Deserialize, Eq, PartialEq, Serialize)]
+/// Minimum distance from the tip necessary for the node to work correctly:
+/// 1. Minimum 2 epochs (32 blocks per epoch) required to handle any reorg according to the
+///    consensus protocol.
+/// 2. Another 10k blocks to have a room for maneuver in case when things go wrong and a manual
+///    unwind is required.
+pub const MINIMUM_PRUNING_DISTANCE: u64 = 32 * 2 + 10_000;
+
+/// Pruning configuration for every segment of the data that can be pruned.
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct PruneModes {
     /// Sender Recovery pruning configuration.
-    // TODO(alexey): removing min blocks restriction is possible if we start calculating the senders
-    //  dynamically on blockchain tree unwind.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<64, _>"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_recovery: Option<PruneMode>,
     /// Transaction Lookup pruning configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_lookup: Option<PruneMode>,
-    /// Receipts pruning configuration.
+    /// Receipts pruning configuration. This setting overrides `receipts_log_filter`
+    /// and offers improved performance.
     #[serde(
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<64, _>"
+        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<MINIMUM_PRUNING_DISTANCE, _>"
     )]
     pub receipts: Option<PruneMode>,
     /// Account History pruning configuration.
     #[serde(
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<64, _>"
+        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<MINIMUM_PRUNING_DISTANCE, _>"
     )]
     pub account_history: Option<PruneMode>,
     /// Storage History pruning configuration.
     #[serde(
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<64, _>"
+        deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<MINIMUM_PRUNING_DISTANCE, _>"
     )]
     pub storage_history: Option<PruneMode>,
-}
-
-macro_rules! impl_prune_parts {
-    ($(($part:ident, $variant:ident, $min_blocks:expr)),+) => {
-        $(
-            paste! {
-                #[doc = concat!(
-                    "Check if ",
-                    stringify!($variant),
-                    " should be pruned at the target block according to the provided tip."
-                )]
-                pub fn [<should_prune_ $part>](&self, block: BlockNumber, tip: BlockNumber) -> bool {
-                    if let Some(mode) = &self.$part {
-                        return self.should_prune(mode, block, tip)
-                    }
-                    false
-                }
-            }
-        )+
-
-        $(
-            paste! {
-                #[doc = concat!(
-                    "Returns block up to which ",
-                    stringify!($variant),
-                    " pruning needs to be done, inclusive, according to the provided tip."
-                )]
-                pub fn [<prune_target_block_ $part>](&self, tip: BlockNumber) -> Result<Option<(BlockNumber, PruneMode)>, PrunePartError> {
-                    let min_blocks: u64 = $min_blocks.unwrap_or_default();
-                    match self.$part {
-                        Some(mode) => Ok(match mode {
-                            PruneMode::Full if min_blocks == 0 => Some((tip, mode)),
-                            PruneMode::Distance(distance) if distance > tip => None, // Nothing to prune yet
-                            PruneMode::Distance(distance) if distance >= min_blocks => Some((tip - distance, mode)),
-                            PruneMode::Before(n) if n > tip => None, // Nothing to prune yet
-                            PruneMode::Before(n) if tip - n >= min_blocks => Some((n - 1, mode)),
-                            _ => return Err(PrunePartError::Configuration(PrunePart::$variant)),
-                        }),
-                        None => Ok(None)
-                    }
-                }
-            }
-        )+
-
-        /// Sets pruning to all targets.
-        pub fn all() -> Self {
-            Self {
-                $(
-                    $part: Some(PruneMode::Full),
-                )+
-            }
-        }
-
-    };
+    /// Receipts pruning configuration by retaining only those receipts that contain logs emitted
+    /// by the specified addresses, discarding others. This setting is overridden by `receipts`.
+    ///
+    /// The [BlockNumber](`crate::BlockNumber`) represents the starting block from which point
+    /// onwards the receipts are preserved.
+    pub receipts_log_filter: ReceiptsLogPruneConfig,
 }
 
 impl PruneModes {
@@ -100,25 +51,76 @@ impl PruneModes {
         PruneModes::default()
     }
 
-    /// Check if target block should be pruned according to the provided prune mode and tip.
-    pub fn should_prune(&self, mode: &PruneMode, block: BlockNumber, tip: BlockNumber) -> bool {
-        match mode {
-            PruneMode::Full => true,
-            PruneMode::Distance(distance) => {
-                if *distance > tip {
-                    return false
-                }
-                block < tip - *distance
-            }
-            PruneMode::Before(n) => *n > block,
+    /// Sets pruning to all targets.
+    pub fn all() -> Self {
+        Self {
+            sender_recovery: Some(PruneMode::Full),
+            transaction_lookup: Some(PruneMode::Full),
+            receipts: Some(PruneMode::Full),
+            account_history: Some(PruneMode::Full),
+            storage_history: Some(PruneMode::Full),
+            receipts_log_filter: Default::default(),
         }
     }
+}
 
-    impl_prune_parts!(
-        (sender_recovery, SenderRecovery, Some(64)),
-        (transaction_lookup, TransactionLookup, None),
-        (receipts, Receipts, Some(64)),
-        (account_history, AccountHistory, Some(64)),
-        (storage_history, StorageHistory, Some(64))
-    );
+/// Deserializes [`Option<PruneMode>`] and validates that the value is not less than the const
+/// generic parameter `MIN_BLOCKS`. This parameter represents the number of blocks that needs to be
+/// left in database after the pruning.
+///
+/// 1. For [PruneMode::Full], it fails if `MIN_BLOCKS > 0`.
+/// 2. For [PruneMode::Distance(distance)], it fails if `distance < MIN_BLOCKS + 1`. `+ 1` is needed
+/// because `PruneMode::Distance(0)` means that we leave zero blocks from the latest, meaning we
+/// have one block in the database.
+fn deserialize_opt_prune_mode_with_min_blocks<'de, const MIN_BLOCKS: u64, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PruneMode>, D::Error> {
+    let prune_mode = Option::<PruneMode>::deserialize(deserializer)?;
+
+    match prune_mode {
+        Some(PruneMode::Full) if MIN_BLOCKS > 0 => {
+            Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str("full"),
+                // This message should have "expected" wording
+                &format!("prune mode that leaves at least {MIN_BLOCKS} blocks in the database")
+                    .as_str(),
+            ))
+        }
+        Some(PruneMode::Distance(distance)) if distance < MIN_BLOCKS => {
+            Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Unsigned(distance),
+                // This message should have "expected" wording
+                &format!("prune mode that leaves at least {MIN_BLOCKS} blocks in the database")
+                    .as_str(),
+            ))
+        }
+        _ => Ok(prune_mode),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_matches::assert_matches;
+    use serde::Deserialize;
+
+    #[test]
+    fn test_deserialize_opt_prune_mode_with_min_blocks() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct V(
+            #[serde(deserialize_with = "deserialize_opt_prune_mode_with_min_blocks::<10, _>")]
+            Option<PruneMode>,
+        );
+
+        assert!(serde_json::from_str::<V>(r#"{"distance": 10}"#).is_ok());
+        assert_matches!(
+            serde_json::from_str::<V>(r#"{"distance": 9}"#),
+            Err(err) if err.to_string() == "invalid value: integer `9`, expected prune mode that leaves at least 10 blocks in the database"
+        );
+
+        assert_matches!(
+            serde_json::from_str::<V>(r#""full""#),
+            Err(err) if err.to_string() == "invalid value: string \"full\", expected prune mode that leaves at least 10 blocks in the database"
+        );
+    }
 }

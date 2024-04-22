@@ -1,35 +1,46 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
+//! Revm utils and implementations specific to reth.
+
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
-    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
+    issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![warn(missing_docs, unreachable_pub, unused_crate_dependencies)]
-#![deny(unused_must_use, rust_2018_idioms)]
-#![doc(test(
-    no_crate_inject,
-    attr(deny(warnings, rust_2018_idioms), allow(dead_code, unused_variables))
-))]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-//! revm utils and implementations specific to reth.
-
-/// Contains glue code for integrating reth database into revm's [Database](revm::Database).
+/// Contains glue code for integrating reth database into revm's [Database].
 pub mod database;
 
 /// revm implementation of reth block and transaction executors.
-pub mod executor;
 mod factory;
 
+pub mod batch;
+
+/// new revm account state executor
+pub mod processor;
+
+/// State changes that are not related to transactions.
+pub mod state_change;
+
 /// revm executor factory.
-pub use factory::Factory;
+pub use factory::EvmProcessorFactory;
 
-/// reexport for convenience
-pub use reth_revm_inspectors::*;
-/// reexport for convenience
-pub use reth_revm_primitives::*;
-
-/// Re-export everything
-pub use revm;
-
-/// Etereum DAO hardfork state change data.
+/// Ethereum DAO hardfork state change data.
 pub mod eth_dao_fork;
+
+/// An inspector stack abstracting the implementation details of
+/// each inspector and allowing to hook on block/transaction execution,
+/// used in the main Reth executor.
+pub mod stack;
+
+/// Optimism-specific implementation and utilities for the executor
+#[cfg(feature = "optimism")]
+pub mod optimism;
+
+/// Common test helpers
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
+// Convenience re-exports.
+pub use revm::{self, *};
+pub use revm_inspectors::*;

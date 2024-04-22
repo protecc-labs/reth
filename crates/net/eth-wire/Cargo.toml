@@ -8,27 +8,26 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
+# reth
+reth-codecs.workspace = true
+reth-primitives.workspace = true
+reth-ecies.workspace = true
+alloy-rlp = { workspace = true, features = ["derive"] }
+reth-discv4.workspace = true
+reth-eth-wire-types.workspace = true
+
+# metrics
+reth-metrics.workspace = true
+metrics.workspace = true
+
 bytes.workspace = true
+derive_more.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
-
-# reth
-reth-codecs = { path = "../../storage/codecs" }
-reth-primitives.workspace = true
-reth-ecies = { path = "../ecies" }
-reth-rlp = { workspace = true, features = [
-    "alloc",
-    "derive",
-    "std",
-    "ethereum-types",
-    "smol_str",
-] }
-reth-metrics.workspace = true
-
-# used for Chain and builders
-ethers-core = { workspace = true, default-features = false }
-
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["io", "codec"] }
 futures.workspace = true
@@ -36,34 +35,41 @@ tokio-stream.workspace = true
 pin-project.workspace = true
 tracing.workspace = true
 snap = "1.0.5"
-smol_str = "0.2"
-async-trait.workspace = true
 
 # arbitrary utils
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 proptest = { workspace = true, optional = true }
-proptest-derive = { version = "0.3", optional = true }
+proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
+reth-net-common.workspace = true
 reth-primitives = { workspace = true, features = ["arbitrary"] }
-reth-tracing = { path = "../../tracing" }
-ethers-core = { workspace = true, default-features = false }
+reth-tracing.workspace = true
 
-test-fuzz = "4"
+test-fuzz.workspace = true
 tokio-util = { workspace = true, features = ["io", "codec"] }
-hex-literal = "0.3"
-hex = "0.4"
 rand.workspace = true
-secp256k1 = { workspace = true, features = ["global-context", "rand-std", "recovery"] }
+secp256k1 = { workspace = true, features = [
+    "global-context",
+    "rand-std",
+    "recovery",
+] }
 
 arbitrary = { workspace = true, features = ["derive"] }
 proptest.workspace = true
-proptest-derive = "0.3"
+proptest-derive.workspace = true
+async-stream.workspace = true
 
 [features]
 default = ["serde"]
-serde = ["dep:serde", "smol_str/serde"]
-arbitrary = ["reth-primitives/arbitrary", "dep:arbitrary", "dep:proptest", "dep:proptest-derive"]
+serde = ["dep:serde"]
+arbitrary = [
+    "reth-primitives/arbitrary",
+    "dep:arbitrary",
+    "dep:proptest",
+    "dep:proptest-derive",
+]
+optimism = ["reth-primitives/optimism"]
 
 [[test]]
 name = "fuzz_roundtrip"

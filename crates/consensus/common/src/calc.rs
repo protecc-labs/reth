@@ -1,5 +1,4 @@
 use reth_primitives::{constants::ETH_TO_WEI, BlockNumber, Chain, ChainSpec, Hardfork, U256};
-
 /// Calculates the base block reward.
 ///
 /// The base block reward is defined as:
@@ -29,7 +28,7 @@ pub fn base_block_reward(
         chain_spec.fork(Hardfork::Paris).active_at_ttd(total_difficulty, block_difficulty)
     {
         None
-    } else if chain_spec.fork(Hardfork::Petersburg).active_at_block(block_number) {
+    } else if chain_spec.fork(Hardfork::Constantinople).active_at_block(block_number) {
         Some(ETH_TO_WEI * 2)
     } else if chain_spec.fork(Hardfork::Byzantium).active_at_block(block_number) {
         Some(ETH_TO_WEI * 3)
@@ -56,13 +55,11 @@ pub fn base_block_reward(
 /// let total_difficulty = U256::from(2_235_668_675_900usize);
 /// let number_of_ommers = 1;
 ///
-/// let reward = base_block_reward(&MAINNET, block_number, block_difficulty, total_difficulty).map(|reward| block_reward(reward, 1));
+/// let reward = base_block_reward(&MAINNET, block_number, block_difficulty, total_difficulty)
+///     .map(|reward| block_reward(reward, 1));
 ///
 /// // The base block reward is 5 ETH, and the ommer inclusion reward is 1/32th of 5 ETH.
-/// assert_eq!(
-///     reward.unwrap(),
-///     U256::from(ETH_TO_WEI * 5 + ((ETH_TO_WEI * 5) >> 5))
-/// );
+/// assert_eq!(reward.unwrap(), ETH_TO_WEI * 5 + ((ETH_TO_WEI * 5) >> 5));
 /// ```
 ///
 /// # References
@@ -70,8 +67,8 @@ pub fn base_block_reward(
 /// - Definition: [Yellow Paper][yp] (page 15, 11.3)
 ///
 /// [yp]: https://ethereum.github.io/yellowpaper/paper.pdf
-pub fn block_reward(base_block_reward: u128, ommers: usize) -> U256 {
-    U256::from(base_block_reward + (base_block_reward >> 5) * ommers as u128)
+pub fn block_reward(base_block_reward: u128, ommers: usize) -> u128 {
+    base_block_reward + (base_block_reward >> 5) * ommers as u128
 }
 
 /// Calculate the reward for an ommer.
@@ -83,7 +80,7 @@ pub fn block_reward(base_block_reward: u128, ommers: usize) -> U256 {
 ///
 /// From the yellow paper (page 15):
 ///
-/// > If there are collissions of the beneficiary addresses between ommers and the block (i.e. two
+/// > If there are collisions of the beneficiary addresses between ommers and the block (i.e. two
 /// > ommers with the same beneficiary address or an ommer with the same beneficiary address as the
 /// > present block), additions are applied cumulatively.
 ///
@@ -98,14 +95,14 @@ pub fn ommer_reward(
     base_block_reward: u128,
     block_number: BlockNumber,
     ommer_block_number: BlockNumber,
-) -> U256 {
-    U256::from(((8 + ommer_block_number - block_number) as u128 * base_block_reward) >> 3)
+) -> u128 {
+    ((8 + ommer_block_number - block_number) as u128 * base_block_reward) >> 3
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_primitives::{MAINNET, U256};
+    use reth_primitives::MAINNET;
 
     #[test]
     fn calc_base_block_reward() {
@@ -139,7 +136,7 @@ mod tests {
         ];
 
         for (num_ommers, expected_reward) in cases {
-            assert_eq!(block_reward(base_reward, num_ommers), U256::from(expected_reward));
+            assert_eq!(block_reward(base_reward, num_ommers), expected_reward);
         }
     }
 }

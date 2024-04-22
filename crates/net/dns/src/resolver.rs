@@ -1,32 +1,25 @@
 //! Perform DNS lookups
 
-use async_trait::async_trait;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future};
 use tracing::trace;
 pub use trust_dns_resolver::{error::ResolveError, TokioAsyncResolver};
-use trust_dns_resolver::{proto::DnsHandle, AsyncResolver, ConnectionProvider};
+use trust_dns_resolver::{name_server::ConnectionProvider, AsyncResolver};
 
 /// A type that can lookup DNS entries
-#[async_trait]
 pub trait Resolver: Send + Sync + Unpin + 'static {
     /// Performs a textual lookup and returns the first text
-    async fn lookup_txt(&self, query: &str) -> Option<String>;
+    fn lookup_txt(&self, query: &str) -> impl Future<Output = Option<String>> + Send;
 }
 
-#[async_trait]
-impl<C, P> Resolver for AsyncResolver<C, P>
-where
-    C: DnsHandle<Error = ResolveError>,
-    P: ConnectionProvider<Conn = C>,
-{
+impl<P: ConnectionProvider> Resolver for AsyncResolver<P> {
     async fn lookup_txt(&self, query: &str) -> Option<String> {
         // See: [AsyncResolver::txt_lookup]
         // > *hint* queries that end with a '.' are fully qualified names and are cheaper lookups
         let fqn = if query.ends_with('.') { query.to_string() } else { format!("{query}.") };
         match self.txt_lookup(fqn).await {
             Err(err) => {
-                trace!(target: "disc::dns", ?err, ?query, "dns lookup failed");
+                trace!(target: "disc::dns", %err, ?query, "dns lookup failed");
                 None
             }
             Ok(lookup) => {
@@ -40,19 +33,19 @@ where
 
 /// An asynchronous DNS resolver
 ///
-/// See also [TokioAsyncResolver](trust_dns_resolver::TokioAsyncResolver)
+/// See also [TokioAsyncResolver]
 ///
 /// ```
 /// # fn t() {
-///  use reth_dns_discovery::resolver::DnsResolver;
-///  let resolver = DnsResolver::from_system_conf().unwrap();
+/// use reth_dns_discovery::resolver::DnsResolver;
+/// let resolver = DnsResolver::from_system_conf().unwrap();
 /// # }
 /// ```
 ///
 /// Note: This [Resolver] can send multiple lookup attempts, See also
 /// [ResolverOpts](trust_dns_resolver::config::ResolverOpts) which configures 2 attempts (1 retry)
 /// by default.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DnsResolver(TokioAsyncResolver);
 
 // === impl DnsResolver ===
@@ -71,7 +64,6 @@ impl DnsResolver {
     }
 }
 
-#[async_trait]
 impl Resolver for DnsResolver {
     async fn lookup_txt(&self, query: &str) -> Option<String> {
         Resolver::lookup_txt(&self.0, query).await
@@ -102,7 +94,6 @@ impl MapResolver {
     }
 }
 
-#[async_trait]
 impl Resolver for MapResolver {
     async fn lookup_txt(&self, query: &str) -> Option<String> {
         self.get(query)
@@ -114,7 +105,6 @@ impl Resolver for MapResolver {
 pub(crate) struct TimeoutResolver(pub(crate) std::time::Duration);
 
 #[cfg(test)]
-#[async_trait]
 impl Resolver for TimeoutResolver {
     async fn lookup_txt(&self, _query: &str) -> Option<String> {
         tokio::time::sleep(self.0).await;

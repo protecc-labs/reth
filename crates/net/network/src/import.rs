@@ -1,9 +1,11 @@
+//! This module provides an abstraction over block import in the form of the `BlockImport` trait.
+
 use crate::message::NewBlockMessage;
 use reth_primitives::PeerId;
 use std::task::{Context, Poll};
 
 /// Abstraction over block import.
-pub trait BlockImport: Send + Sync {
+pub trait BlockImport: std::fmt::Debug + Send + Sync {
     /// Invoked for a received `NewBlock` broadcast message from the peer.
     ///
     /// > When a `NewBlock` announcement message is received from a peer, the client first verifies
@@ -18,6 +20,7 @@ pub trait BlockImport: Send + Sync {
 }
 
 /// Outcome of the [`BlockImport`]'s block handling.
+#[derive(Debug)]
 pub struct BlockImportOutcome {
     /// Sender of the `NewBlock` message.
     pub peer: PeerId,

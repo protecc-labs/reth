@@ -1,13 +1,15 @@
 //! Test runners for `BlockchainTests` in <https://github.com/ethereum/tests>
 
 use crate::{
-    models::{BlockchainTest, ForkSpec, RootOrState},
+    models::{BlockchainTest, ForkSpec},
     Case, Error, Suite,
 };
-use reth_db::test_utils::create_test_rw_db;
-use reth_primitives::{BlockBody, SealedBlock};
-use reth_provider::{BlockWriter, ProviderFactory};
-use reth_rlp::Decodable;
+use alloy_rlp::Decodable;
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use reth_db::test_utils::{create_test_rw_db, create_test_static_files_dir};
+use reth_node_ethereum::EthEvmConfig;
+use reth_primitives::{BlockBody, SealedBlock, StaticFileSegment};
+use reth_provider::{providers::StaticFileWriter, HashingWriter, ProviderFactory};
 use reth_stages::{stages::ExecutionStage, ExecInput, Stage};
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
@@ -52,78 +54,124 @@ impl Case for BlockchainTestCase {
         })
     }
 
-    // TODO: Clean up
+    /// Runs the test cases for the Ethereum Forks test suite.
+    ///
+    /// # Errors
+    /// Returns an error if the test is flagged for skipping or encounters issues during execution.
     fn run(&self) -> Result<(), Error> {
+        // If the test is marked for skipping, return a Skipped error immediately.
         if self.skip {
             return Err(Error::Skipped)
         }
 
-        for case in self.tests.values() {
-            if matches!(
-                case.network,
-                ForkSpec::ByzantiumToConstantinopleAt5 |
-                    ForkSpec::Constantinople |
-                    ForkSpec::ConstantinopleFix |
-                    ForkSpec::MergeEOF |
-                    ForkSpec::MergeMeterInitCode |
-                    ForkSpec::MergePush0 |
-                    ForkSpec::Unknown
-            ) {
-                continue
-            }
-
-            // Create the database
-            let db = create_test_rw_db();
-            let factory = ProviderFactory::new(db.as_ref(), Arc::new(case.network.clone().into()));
-            let provider = factory.provider_rw().unwrap();
-
-            // Insert test state
-            provider.insert_block(
-                SealedBlock::new(case.genesis_block_header.clone().into(), BlockBody::default()),
-                None,
-            )?;
-            case.pre.write_to_db(provider.tx_ref())?;
-
-            let mut last_block = None;
-            for block in case.blocks.iter() {
-                let decoded = SealedBlock::decode(&mut block.rlp.as_ref())?;
-                last_block = Some(decoded.number);
-                provider.insert_block(decoded, None)?;
-            }
-
-            // Call execution stage
-            {
-                let mut stage = ExecutionStage::new_with_factory(reth_revm::Factory::new(
+        // Iterate through test cases, filtering by the network type to exclude specific forks.
+        self.tests
+            .values()
+            .filter(|case| {
+                !matches!(
+                    case.network,
+                    ForkSpec::ByzantiumToConstantinopleAt5 |
+                        ForkSpec::Constantinople |
+                        ForkSpec::ConstantinopleFix |
+                        ForkSpec::MergeEOF |
+                        ForkSpec::MergeMeterInitCode |
+                        ForkSpec::MergePush0 |
+                        ForkSpec::Unknown
+                )
+            })
+            .par_bridge()
+            .try_for_each(|case| {
+                // Create a new test database and initialize a provider for the test case.
+                let db = create_test_rw_db();
+                let (_static_files_dir, static_files_dir_path) = create_test_static_files_dir();
+                let provider = ProviderFactory::new(
+                    db.as_ref(),
                     Arc::new(case.network.clone().into()),
-                ));
+                    static_files_dir_path,
+                )?
+                .provider_rw()
+                .unwrap();
 
-                tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .expect("Could not build tokio RT")
-                    .block_on(async {
-                        // ignore error
-                        let _ = stage
-                            .execute(&provider, ExecInput { target: last_block, checkpoint: None })
-                            .await;
-                    });
-            }
+                // Insert initial test state into the provider.
+                provider
+                    .insert_historical_block(
+                        SealedBlock::new(
+                            case.genesis_block_header.clone().into(),
+                            BlockBody::default(),
+                        )
+                        .try_seal_with_senders()
+                        .unwrap(),
+                        None,
+                    )
+                    .map_err(|err| Error::RethError(err.into()))?;
+                case.pre.write_to_db(provider.tx_ref())?;
 
-            // Validate post state
-            match &case.post_state {
-                Some(RootOrState::Root(root)) => {
-                    // TODO: We should really check the state root here...
-                    println!("Post-state root: #{root:?}")
+                // Initialize receipts static file with genesis
+                {
+                    let mut receipts_writer = provider
+                        .static_file_provider()
+                        .latest_writer(StaticFileSegment::Receipts)
+                        .unwrap();
+                    receipts_writer.increment_block(StaticFileSegment::Receipts, 0).unwrap();
+                    receipts_writer.commit_without_sync_all().unwrap();
                 }
-                Some(RootOrState::State(state)) => {
-                    for (&address, account) in state.iter() {
-                        account.assert_db(address, provider.tx_ref())?;
+
+                // Decode and insert blocks, creating a chain of blocks for the test case.
+                let last_block = case.blocks.iter().try_fold(None, |_, block| {
+                    let decoded = SealedBlock::decode(&mut block.rlp.as_ref())?;
+                    provider
+                        .insert_historical_block(
+                            decoded.clone().try_seal_with_senders().unwrap(),
+                            None,
+                        )
+                        .map_err(|err| Error::RethError(err.into()))?;
+                    Ok::<Option<SealedBlock>, Error>(Some(decoded))
+                })?;
+                provider
+                    .static_file_provider()
+                    .latest_writer(StaticFileSegment::Headers)
+                    .unwrap()
+                    .commit_without_sync_all()
+                    .unwrap();
+
+                // Execute the execution stage using the EVM processor factory for the test case
+                // network.
+                let _ = ExecutionStage::new_with_factory(reth_revm::EvmProcessorFactory::new(
+                    Arc::new(case.network.clone().into()),
+                    EthEvmConfig::default(),
+                ))
+                .execute(
+                    &provider,
+                    ExecInput { target: last_block.as_ref().map(|b| b.number), checkpoint: None },
+                );
+
+                // Validate the post-state for the test case.
+                match (&case.post_state, &case.post_state_hash) {
+                    (Some(state), None) => {
+                        // Validate accounts in the state against the provider's database.
+                        for (&address, account) in state.iter() {
+                            account.assert_db(address, provider.tx_ref())?;
+                        }
                     }
+                    (None, Some(expected_state_root)) => {
+                        // Insert state hashes into the provider based on the expected state root.
+                        let last_block = last_block.unwrap_or_default();
+                        provider
+                            .insert_hashes(
+                                0..=last_block.number,
+                                last_block.hash(),
+                                *expected_state_root,
+                            )
+                            .map_err(|err| Error::RethError(err.into()))?;
+                    }
+                    _ => return Err(Error::MissingPostState),
                 }
-                None => println!("No post-state"),
-            }
 
-            drop(provider);
-        }
+                // Drop the provider without committing to the database.
+                drop(provider);
+                Ok(())
+            })?;
+
         Ok(())
     }
 }
@@ -142,6 +190,7 @@ pub fn should_skip(path: &Path) -> bool {
         // funky test with `bigint 0x00` value in json :) not possible to happen on mainnet and require
         // custom json parser. https://github.com/ethereum/tests/issues/971
         | "ValueOverflow.json"
+        | "ValueOverflowParis.json"
 
         // txbyte is of type 02 and we dont parse tx bytes for this test to fail.
         | "typeTwoBerlin.json"
@@ -154,6 +203,7 @@ pub fn should_skip(path: &Path) -> bool {
         // Test check if gas price overflows, we handle this correctly but does not match tests specific
         // exception.
         | "HighGasPrice.json"
+        | "HighGasPriceParis.json"
 
         // Skip test where basefee/accesslist/difficulty is present but it shouldn't be supported in
         // London/Berlin/TheMerge. https://github.com/ethereum/tests/blob/5b7e1ab3ffaf026d99d20b17bb30f533a2c80c8b/GeneralStateTests/stExample/eip1559.json#L130

@@ -3,11 +3,12 @@ use crate::{
     BeaconConsensusEngineEvent,
 };
 use futures::{future::Either, FutureExt};
-use reth_interfaces::consensus::ForkchoiceState;
+use reth_engine_primitives::EngineTypes;
+use reth_interfaces::{consensus::ForkchoiceState, RethResult};
 use reth_payload_builder::error::PayloadBuilderError;
 use reth_rpc_types::engine::{
-    ExecutionPayload, ForkChoiceUpdateResult, ForkchoiceUpdateError, ForkchoiceUpdated,
-    PayloadAttributes, PayloadId, PayloadStatus, PayloadStatusEnum,
+    CancunPayloadFields, ExecutionPayload, ForkChoiceUpdateResult, ForkchoiceUpdateError,
+    ForkchoiceUpdated, PayloadId, PayloadStatus, PayloadStatusEnum,
 };
 use std::{
     future::Future,
@@ -34,18 +35,13 @@ pub struct OnForkChoiceUpdated {
 // === impl OnForkChoiceUpdated ===
 
 impl OnForkChoiceUpdated {
-    /// Returns true if this update is valid
-    pub(crate) fn is_valid_update(&self) -> bool {
-        self.forkchoice_status.is_valid()
-    }
-
     /// Returns the determined status of the received ForkchoiceState.
     pub fn forkchoice_status(&self) -> ForkchoiceStatus {
         self.forkchoice_status
     }
 
     /// Creates a new instance of `OnForkChoiceUpdated` for the `SYNCING` state
-    pub(crate) fn syncing() -> Self {
+    pub fn syncing() -> Self {
         let status = PayloadStatus::from_status(PayloadStatusEnum::Syncing);
         Self {
             forkchoice_status: ForkchoiceStatus::from_payload_status(&status.status),
@@ -145,12 +141,13 @@ impl Future for PendingPayloadId {
 /// A message for the beacon engine from other components of the node (engine RPC API invoked by the
 /// consensus layer).
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum BeaconEngineMessage {
+pub enum BeaconEngineMessage<Engine: EngineTypes> {
     /// Message with new payload.
     NewPayload {
         /// The execution payload received by Engine API.
         payload: ExecutionPayload,
+        /// The cancun-related newPayload fields, if any.
+        cancun_fields: Option<CancunPayloadFields>,
         /// The sender for returning payload status result.
         tx: oneshot::Sender<Result<PayloadStatus, BeaconOnNewPayloadError>>,
     },
@@ -159,9 +156,9 @@ pub enum BeaconEngineMessage {
         /// The updated forkchoice state.
         state: ForkchoiceState,
         /// The payload attributes for block building.
-        payload_attrs: Option<PayloadAttributes>,
+        payload_attrs: Option<Engine::PayloadAttributes>,
         /// The sender for returning forkchoice updated result.
-        tx: oneshot::Sender<Result<OnForkChoiceUpdated, reth_interfaces::Error>>,
+        tx: oneshot::Sender<RethResult<OnForkChoiceUpdated>>,
     },
     /// Message with exchanged transition configuration.
     TransitionConfigurationExchanged,

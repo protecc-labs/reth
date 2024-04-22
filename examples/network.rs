@@ -7,7 +7,7 @@
 //! ```
 
 use futures::StreamExt;
-use reth_network::{config::rng_secret_key, NetworkConfig, NetworkManager};
+use reth_network::{config::rng_secret_key, NetworkConfig, NetworkEvents, NetworkManager};
 use reth_provider::test_utils::NoopProvider;
 
 #[tokio::main]
@@ -19,8 +19,7 @@ async fn main() -> eyre::Result<()> {
     let local_key = rng_secret_key();
 
     // Configure the network
-    let config =
-        NetworkConfig::<NoopProvider>::builder(local_key).mainnet_boot_nodes().build(client);
+    let config = NetworkConfig::builder(local_key).mainnet_boot_nodes().build(client);
 
     // create the network instance
     let network = NetworkManager::new(config).await?;

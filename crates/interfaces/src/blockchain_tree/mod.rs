@@ -1,9 +1,11 @@
-use crate::{blockchain_tree::error::InsertBlockError, Error};
+use crate::{blockchain_tree::error::InsertBlockError, provider::ProviderError, RethResult};
 use reth_primitives::{
     BlockHash, BlockNumHash, BlockNumber, Receipt, SealedBlock, SealedBlockWithSenders,
     SealedHeader,
 };
 use std::collections::{BTreeMap, HashSet};
+
+use self::error::CanonicalError;
 
 pub mod error;
 
@@ -22,9 +24,10 @@ pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     fn insert_block_without_senders(
         &self,
         block: SealedBlock,
+        validation_kind: BlockValidationKind,
     ) -> Result<InsertPayloadOk, InsertBlockError> {
         match block.try_seal_with_senders() {
-            Ok(block) => self.insert_block(block),
+            Ok(block) => self.insert_block(block, validation_kind),
             Err(block) => Err(InsertBlockError::sender_recovery_error(block)),
         }
     }
@@ -43,36 +46,44 @@ pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     /// Buffer block with senders
     fn buffer_block(&self, block: SealedBlockWithSenders) -> Result<(), InsertBlockError>;
 
-    /// Insert block with senders
+    /// Inserts block with senders
+    ///
+    /// The `validation_kind` parameter controls which validation checks are performed.
+    ///
+    /// Caution: If the block was received from the consensus layer, this should always be called
+    /// with [BlockValidationKind::Exhaustive] to validate the state root, if possible to adhere to
+    /// the engine API spec.
     fn insert_block(
         &self,
         block: SealedBlockWithSenders,
+        validation_kind: BlockValidationKind,
     ) -> Result<InsertPayloadOk, InsertBlockError>;
 
     /// Finalize blocks up until and including `finalized_block`, and remove them from the tree.
     fn finalize_block(&self, finalized_block: BlockNumber);
 
     /// Reads the last `N` canonical hashes from the database and updates the block indices of the
-    /// tree.
+    /// tree by attempting to connect the buffered blocks to canonical hashes.
     ///
-    /// `N` is the `max_reorg_depth` plus the number of block hashes needed to satisfy the
+    ///
+    /// `N` is the maximum of `max_reorg_depth` and the number of block hashes needed to satisfy the
     /// `BLOCKHASH` opcode in the EVM.
     ///
     /// # Note
     ///
     /// This finalizes `last_finalized_block` prior to reading the canonical hashes (using
     /// [`BlockchainTreeEngine::finalize_block`]).
-    fn restore_canonical_hashes_and_finalize(
+    fn connect_buffered_blocks_to_canonical_hashes_and_finalize(
         &self,
         last_finalized_block: BlockNumber,
-    ) -> Result<(), Error>;
+    ) -> RethResult<()>;
 
     /// Reads the last `N` canonical hashes from the database and updates the block indices of the
-    /// tree.
+    /// tree by attempting to connect the buffered blocks to canonical hashes.
     ///
-    /// `N` is the `max_reorg_depth` plus the number of block hashes needed to satisfy the
+    /// `N` is the maximum of `max_reorg_depth` and the number of block hashes needed to satisfy the
     /// `BLOCKHASH` opcode in the EVM.
-    fn restore_canonical_hashes(&self) -> Result<(), Error>;
+    fn connect_buffered_blocks_to_canonical_hashes(&self) -> RethResult<()>;
 
     /// Make a block and its parent chain part of the canonical chain by committing it to the
     /// database.
@@ -85,10 +96,49 @@ pub trait BlockchainTreeEngine: BlockchainTreeViewer + Send + Sync {
     /// # Returns
     ///
     /// Returns `Ok` if the blocks were canonicalized, or if the blocks were already canonical.
-    fn make_canonical(&self, block_hash: &BlockHash) -> Result<CanonicalOutcome, Error>;
+    fn make_canonical(&self, block_hash: BlockHash) -> Result<CanonicalOutcome, CanonicalError>;
+}
 
-    /// Unwind tables and put it inside state
-    fn unwind(&self, unwind_to: BlockNumber) -> Result<(), Error>;
+/// Represents the kind of validation that should be performed when inserting a block.
+///
+/// The motivation for this is that the engine API spec requires that block's state root is
+/// validated when received from the CL.
+///
+/// This step is very expensive due to how changesets are stored in the database, so we want to
+/// avoid doing it if not necessary. Blocks can also originate from the network where this step is
+/// not required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockValidationKind {
+    /// All validation checks that can be performed.
+    ///
+    /// This includes validating the state root, if possible.
+    ///
+    /// Note: This should always be used when inserting blocks that originate from the consensus
+    /// layer.
+    #[default]
+    Exhaustive,
+    /// Perform all validation checks except for state root validation.
+    SkipStateRootValidation,
+}
+
+impl BlockValidationKind {
+    /// Returns true if the state root should be validated if possible.
+    pub fn is_exhaustive(&self) -> bool {
+        matches!(self, BlockValidationKind::Exhaustive)
+    }
+}
+
+impl std::fmt::Display for BlockValidationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockValidationKind::Exhaustive => {
+                write!(f, "Exhaustive")
+            }
+            BlockValidationKind::SkipStateRootValidation => {
+                write!(f, "SkipStateRootValidation")
+            }
+        }
+    }
 }
 
 /// All possible outcomes of a canonicalization attempt of [BlockchainTreeEngine::make_canonical].
@@ -131,22 +181,46 @@ impl CanonicalOutcome {
 
 /// From Engine API spec, block inclusion can be valid, accepted or invalid.
 /// Invalid case is already covered by error, but we need to make distinction
-/// between if it is valid (extends canonical chain) or just accepted (is side chain).
-/// If we don't know the block parent we are returning Disconnected status
-/// as we can't make a claim if block is valid or not.
+/// between valid blocks that extend canonical chain and the ones that fork off
+/// into side chains (see [BlockAttachment]). If we don't know the block
+/// parent we are returning Disconnected status as we can't make a claim if
+/// block is valid or not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockStatus {
-    /// If block validation is valid and block extends canonical chain.
-    /// In BlockchainTree sense it forks on canonical tip.
-    Valid,
-    /// If the block is valid, but it does not extend canonical chain.
-    /// (It is side chain) or hasn't been fully validated but ancestors of a payload are known.
-    Accepted,
+    /// If block is valid and block extends canonical chain.
+    /// In BlockchainTree terms, it forks off canonical tip.
+    Valid(BlockAttachment),
+    /// If block is valid and block forks off canonical chain.
     /// If blocks is not connected to canonical chain.
     Disconnected {
         /// The lowest ancestor block that is not connected to the canonical chain.
         missing_ancestor: BlockNumHash,
     },
+}
+
+/// Represents what kind of block is being executed and validated.
+///
+/// This is required to:
+/// - differentiate whether trie state updates should be cached.
+/// - inform other
+/// This is required because the state root check can only be performed if the targeted block can be
+/// traced back to the canonical __head__.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockAttachment {
+    /// The `block` is canonical or a descendant of the canonical head.
+    /// ([`head..(block.parent)*,block`])
+    Canonical,
+    /// The block can be traced back to an ancestor of the canonical head: a historical block, but
+    /// this chain does __not__ include the canonical head.
+    HistoricalFork,
+}
+
+impl BlockAttachment {
+    /// Returns `true` if the block is canonical or a descendant of the canonical head.
+    #[inline]
+    pub const fn is_canonical(&self) -> bool {
+        matches!(self, BlockAttachment::Canonical)
+    }
 }
 
 /// How a payload was inserted if it was valid.
@@ -186,6 +260,12 @@ pub trait BlockchainTreeViewer: Send + Sync {
     /// disconnected from the canonical chain.
     fn block_by_hash(&self, hash: BlockHash) -> Option<SealedBlock>;
 
+    /// Returns the block with matching hash from the tree, if it exists.
+    ///
+    /// Caution: This will not return blocks from the canonical chain or buffered blocks that are
+    /// disconnected from the canonical chain.
+    fn block_with_senders_by_hash(&self, hash: BlockHash) -> Option<SealedBlockWithSenders>;
+
     /// Returns the _buffered_ (disconnected) block with matching hash from the internal buffer if
     /// it exists.
     ///
@@ -208,17 +288,8 @@ pub trait BlockchainTreeViewer: Send + Sync {
     /// Canonical block number and hashes best known by the tree.
     fn canonical_blocks(&self) -> BTreeMap<BlockNumber, BlockHash>;
 
-    /// Given the parent hash of a block, this tries to find the last ancestor that is part of the
-    /// canonical chain.
-    ///
-    /// In other words, this will walk up the (side) chain starting with the given hash and return
-    /// the first block that's canonical.
-    ///
-    /// Note: this could be the given `parent_hash` if it's already canonical.
-    fn find_canonical_ancestor(&self, parent_hash: BlockHash) -> Option<BlockHash>;
-
     /// Return whether or not the block is known and in the canonical chain.
-    fn is_canonical(&self, hash: BlockHash) -> Result<bool, Error>;
+    fn is_canonical(&self, hash: BlockHash) -> Result<bool, ProviderError>;
 
     /// Given the hash of a block, this checks the buffered blocks for the lowest ancestor in the
     /// buffer.
@@ -242,6 +313,11 @@ pub trait BlockchainTreeViewer: Send + Sync {
     /// Returns the pending block if there is one.
     fn pending_block(&self) -> Option<SealedBlock> {
         self.block_by_hash(self.pending_block_num_hash()?.hash)
+    }
+
+    /// Returns the pending block if there is one.
+    fn pending_block_with_senders(&self) -> Option<SealedBlockWithSenders> {
+        self.block_with_senders_by_hash(self.pending_block_num_hash()?.hash)
     }
 
     /// Returns the pending block and its receipts in one call.

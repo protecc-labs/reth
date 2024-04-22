@@ -1,8 +1,9 @@
 //! Builder support for configuring the entire setup.
 
 use crate::{
-    eth_requests::EthRequestHandler, transactions::TransactionsManager, NetworkHandle,
-    NetworkManager,
+    eth_requests::EthRequestHandler,
+    transactions::{TransactionsManager, TransactionsManagerConfig},
+    NetworkHandle, NetworkManager,
 };
 use reth_transaction_pool::TransactionPool;
 use tokio::sync::mpsc;
@@ -12,6 +13,7 @@ use tokio::sync::mpsc;
 pub(crate) const ETH_REQUEST_CHANNEL_CAPACITY: usize = 256;
 
 /// A builder that can configure all components of the network.
+#[allow(missing_debug_implementations)]
 pub struct NetworkBuilder<C, Tx, Eth> {
     pub(crate) network: NetworkManager<C>,
     pub(crate) transactions: Tx,
@@ -27,6 +29,21 @@ impl<C, Tx, Eth> NetworkBuilder<C, Tx, Eth> {
         (network, transactions, request_handler)
     }
 
+    /// Returns the network manager.
+    pub fn network(&self) -> &NetworkManager<C> {
+        &self.network
+    }
+
+    /// Returns the mutable network manager.
+    pub fn network_mut(&mut self) -> &mut NetworkManager<C> {
+        &mut self.network
+    }
+
+    /// Returns the handle to the network.
+    pub fn handle(&self) -> NetworkHandle {
+        self.network.handle().clone()
+    }
+
     /// Consumes the type and returns all fields and also return a [`NetworkHandle`].
     pub fn split_with_handle(self) -> (NetworkHandle, NetworkManager<C>, Tx, Eth) {
         let NetworkBuilder { network, transactions, request_handler } = self;
@@ -38,12 +55,13 @@ impl<C, Tx, Eth> NetworkBuilder<C, Tx, Eth> {
     pub fn transactions<Pool: TransactionPool>(
         self,
         pool: Pool,
+        transactions_manager_config: TransactionsManagerConfig,
     ) -> NetworkBuilder<C, TransactionsManager<Pool>, Eth> {
         let NetworkBuilder { mut network, request_handler, .. } = self;
         let (tx, rx) = mpsc::unbounded_channel();
         network.set_transactions(tx);
         let handle = network.handle().clone();
-        let transactions = TransactionsManager::new(handle, pool, rx);
+        let transactions = TransactionsManager::new(handle, pool, rx, transactions_manager_config);
         NetworkBuilder { network, request_handler, transactions }
     }
 

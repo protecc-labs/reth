@@ -1,23 +1,18 @@
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
-    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
-    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
-)]
-#![warn(missing_docs, unused_crate_dependencies)]
-#![deny(unused_must_use, rust_2018_idioms)]
-#![doc(test(
-    no_crate_inject,
-    attr(deny(warnings, rust_2018_idioms), allow(dead_code, unused_variables))
-))]
-
 //! Helpers for resolving the external IP.
 //!
 //! ## Feature Flags
 //!
 //! - `serde` (default): Enable serde support
 
-use igd::aio::search_gateway;
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
+    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
+    issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
+)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
+use igd_next::aio::tokio::search_gateway;
 use pin_project_lite::pin_project;
 use std::{
     fmt,
@@ -114,6 +109,16 @@ pub struct ResolveNatInterval {
 
 // === impl ResolveNatInterval ===
 
+impl fmt::Debug for ResolveNatInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolveNatInterval")
+            .field("resolver", &self.resolver)
+            .field("future", &self.future.as_ref().map(drop))
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
 impl ResolveNatInterval {
     fn with_interval(resolver: NatResolver, interval: tokio::time::Interval) -> Self {
         Self { resolver, future: None, interval }
@@ -128,7 +133,7 @@ impl ResolveNatInterval {
     }
 
     /// Creates a new [ResolveNatInterval] that attempts to resolve the public IP with interval of
-    /// period with the first attempt starting at `sart`. See also [tokio::time::interval_at]
+    /// period with the first attempt starting at `start`. See also [tokio::time::interval_at]
     #[track_caller]
     pub fn interval_at(
         resolver: NatResolver,
@@ -240,14 +245,14 @@ async fn resolve_external_ip_upnp() -> Option<IpAddr> {
     search_gateway(Default::default())
         .await
         .map_err(|err| {
-            debug!(target: "net::nat", ?err, "Failed to resolve external IP via UPnP: failed to find gateway");
+            debug!(target: "net::nat", %err, "Failed to resolve external IP via UPnP: failed to find gateway");
             err
         })
         .ok()?
         .get_external_ip()
         .await
         .map_err(|err| {
-            debug!(target: "net::nat", ?err, "Failed to resolve external IP via UPnP");
+            debug!(target: "net::nat", %err, "Failed to resolve external IP via UPnP");
             err
         })
         .ok()

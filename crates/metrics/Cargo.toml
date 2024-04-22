@@ -8,16 +8,20 @@ homepage.workspace = true
 repository.workspace = true
 description = "reth metrics utilities"
 
+[lints]
+workspace = true
+
 [dependencies]
 # reth
-reth-metrics-derive = { path = "./metrics-derive" }
+reth-metrics-derive.workspace = true
 
 # metrics
-metrics = "0.20.1"
+metrics.workspace = true
 
 # async
 tokio = { workspace = true, features = ["full"], optional = true }
 futures = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 
 [features]
-common = ["tokio", "futures"]
+common = ["tokio", "futures", "tokio-util"]

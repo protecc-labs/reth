@@ -102,13 +102,18 @@ RUSTFLAGS="-C target-cpu=native" cargo build --profile maxperf
 
 **Features**
 
-Finally, some features may improve performance on your system, most notably `jemalloc`, which replaces the default memory allocator used by reth.
+Finally, some optional features are present that may improve performance, but may not very portable,
+and as such might not compile on your particular system. These are currently:
+- `jemalloc`: replaces the default system memory allocator with [`jemalloc`](https://jemalloc.net/); this feature is unstable on Windows
+- `asm-keccak`: replaces the default, pure-Rust implementation of Keccak256 with one implemented in assembly; see [the `keccak-asm` crate](https://github.com/DaniPopes/keccak-asm) for more details and supported targets
+- `min-LEVEL-logs`, where `LEVEL` is one of `error`, `warn`, `info`, `debug`, `trace`: disables compilation of logs of lower level than the given one; this in general isn't that significant, and is not recommended due to the loss of debugging that the logs would provide
 
-You can enable features by passing them to the `--features` Cargo flag.
+You can activate features by passing them to the `--features` or `-F` Cargo flag;
+multiple features can be activated with a space- or comma-separated list to the flag:
 
-> **Note**
-> 
-> The `jemalloc` feature is unstable on Windows due to jemallocator itself.
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --profile maxperf --features jemalloc,asm-keccak
+```
 
 ## Troubleshooting
 
@@ -130,6 +135,17 @@ If compilation fails with `(signal: 9, SIGKILL: kill)`, this could mean your mac
 memory during compilation. If you are on Docker, consider increasing the memory of the container, or use a [pre-built
 binary](../installation/binaries.md).
 
+If compilation fails in either the `keccak-asm` or `sha3-asm` crates, it is likely that your current
+system configuration is not supported. See the [`keccak-asm` target table](https://github.com/DaniPopes/keccak-asm?tab=readme-ov-file#support) for supported targets.
+
 If compilation fails with `error: linking with cc failed: exit code: 1`, try running `cargo clean`.
 
 _(Thanks to Sigma Prime for this section from [their Lighthouse book](https://lighthouse-book.sigmaprime.io/installation.html)!)_
+
+### Bus error (WSL2)
+
+In WSL 2 on Windows, the default virtual disk size is set to 1TB. 
+
+You must increase the allocated disk size for your WSL2 instance before syncing reth.
+
+You can follow the instructions here: [how to expand the size of your WSL2 virtual hard disk.](https://learn.microsoft.com/en-us/windows/wsl/disk-space#how-to-expand-the-size-of-your-wsl-2-virtual-hard-disk)

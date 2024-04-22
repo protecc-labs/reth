@@ -56,25 +56,22 @@ impl ChainInfoTracker {
     }
 
     /// Returns the canonical head of the chain.
-    #[allow(unused)]
     pub(crate) fn get_canonical_head(&self) -> SealedHeader {
         self.inner.canonical_head.read().clone()
     }
 
     /// Returns the safe header of the chain.
-    #[allow(unused)]
     pub(crate) fn get_safe_header(&self) -> Option<SealedHeader> {
         self.inner.safe_block.read().clone()
     }
 
     /// Returns the finalized header of the chain.
-    #[allow(unused)]
     pub(crate) fn get_finalized_header(&self) -> Option<SealedHeader> {
         self.inner.finalized_block.read().clone()
     }
 
     /// Returns the canonical head of the chain.
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn get_canonical_num_hash(&self) -> BlockNumHash {
         self.inner.canonical_head.read().num_hash()
     }
@@ -85,14 +82,14 @@ impl ChainInfoTracker {
     }
 
     /// Returns the safe header of the chain.
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn get_safe_num_hash(&self) -> Option<BlockNumHash> {
         let h = self.inner.safe_block.read();
         h.as_ref().map(|h| h.num_hash())
     }
 
     /// Returns the finalized header of the chain.
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn get_finalized_num_hash(&self) -> Option<BlockNumHash> {
         let h = self.inner.finalized_block.read();
         h.as_ref().map(|h| h.num_hash())

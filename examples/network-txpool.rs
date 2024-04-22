@@ -10,8 +10,9 @@
 use reth_network::{config::rng_secret_key, NetworkConfig, NetworkManager};
 use reth_provider::test_utils::NoopProvider;
 use reth_transaction_pool::{
-    CoinbaseTipOrdering, PoolTransaction, PooledTransaction, TransactionOrigin, TransactionPool,
-    TransactionValidationOutcome, TransactionValidator,
+    blobstore::InMemoryBlobStore, validate::ValidTransaction, CoinbaseTipOrdering,
+    EthPooledTransaction, PoolTransaction, TransactionListenerKind, TransactionOrigin,
+    TransactionPool, TransactionValidationOutcome, TransactionValidator,
 };
 
 #[tokio::main]
@@ -25,6 +26,7 @@ async fn main() -> eyre::Result<()> {
     let pool = reth_transaction_pool::Pool::new(
         OkValidator::default(),
         CoinbaseTipOrdering::default(),
+        InMemoryBlobStore::default(),
         Default::default(),
     );
 
@@ -32,12 +34,16 @@ async fn main() -> eyre::Result<()> {
     let local_key = rng_secret_key();
 
     // Configure the network
-    let config =
-        NetworkConfig::<NoopProvider>::builder(local_key).mainnet_boot_nodes().build(client);
-
+    let config = NetworkConfig::builder(local_key).mainnet_boot_nodes().build(client);
+    let transactions_manager_config = config.transactions_manager_config.clone();
     // create the network instance
-    let (_handle, network, txpool, _) =
-        NetworkManager::builder(config).await?.transactions(pool.clone()).split_with_handle();
+    let (_handle, network, txpool, _) = NetworkManager::builder(config)
+        .await?
+        .transactions(pool.clone(), transactions_manager_config)
+        .split_with_handle();
+
+    // this can be used to interact with the `txpool` service directly
+    let _txs_handle = txpool.handle();
 
     // spawn the network task
     tokio::task::spawn(network);
@@ -45,7 +51,7 @@ async fn main() -> eyre::Result<()> {
     tokio::task::spawn(txpool);
 
     // listen for new transactions
-    let mut txs = pool.pending_transactions_listener();
+    let mut txs = pool.pending_transactions_listener_for(TransactionListenerKind::All);
 
     while let Some(tx) = txs.recv().await {
         println!("Received new transaction: {:?}", tx);
@@ -57,8 +63,8 @@ async fn main() -> eyre::Result<()> {
 /// A transaction validator that determines all transactions to be valid.
 ///
 /// An actual validator impl like
-/// [EthTransactionValidator](reth_transaction_pool::EthTransactionValidator) would require up to
-/// date db access.
+/// [TransactionValidationTaskExecutor](reth_transaction_pool::TransactionValidationTaskExecutor)
+/// would require up to date db access.
 ///
 /// CAUTION: This validator is not safe to use since it doesn't actually validate the transaction's
 /// properties such as chain id, balance, nonce, etc.
@@ -66,9 +72,8 @@ async fn main() -> eyre::Result<()> {
 #[non_exhaustive]
 struct OkValidator;
 
-#[async_trait::async_trait]
 impl TransactionValidator for OkValidator {
-    type Transaction = PooledTransaction;
+    type Transaction = EthPooledTransaction;
 
     async fn validate_transaction(
         &self,
@@ -79,7 +84,7 @@ impl TransactionValidator for OkValidator {
         TransactionValidationOutcome::Valid {
             balance: transaction.cost(),
             state_nonce: transaction.nonce(),
-            transaction,
+            transaction: ValidTransaction::Valid(transaction),
             propagate: false,
         }
     }

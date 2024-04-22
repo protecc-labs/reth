@@ -1,45 +1,68 @@
 //! Executor Factory
 
-use crate::{post_state::PostState, StateProvider};
+use crate::{bundle_state::BundleStateWithReceipts, StateProvider};
 use reth_interfaces::executor::BlockExecutionError;
-use reth_primitives::{Address, Block, ChainSpec, U256};
+use reth_primitives::{BlockNumber, BlockWithSenders, PruneModes, Receipt, U256};
 
-/// Executor factory that would create the EVM with particular state provider.
-///
-/// It can be used to mock executor.
+/// A factory capable of creating an executor with the given state provider.
 pub trait ExecutorFactory: Send + Sync + 'static {
-    /// The executor produced by the factory
-    type Executor<T: StateProvider>: BlockExecutor<T>;
-
     /// Executor with [`StateProvider`]
-    fn with_sp<SP: StateProvider>(&self, sp: SP) -> Self::Executor<SP>;
-
-    /// Return internal chainspec
-    fn chain_spec(&self) -> &ChainSpec;
+    fn with_state<'a, SP: StateProvider + 'a>(
+        &'a self,
+        sp: SP,
+    ) -> Box<dyn PrunableBlockExecutor<Error = BlockExecutionError> + 'a>;
 }
 
 /// An executor capable of executing a block.
-pub trait BlockExecutor<SP: StateProvider> {
-    /// Execute a block.
-    ///
-    /// The number of `senders` should be equal to the number of transactions in the block.
-    ///
-    /// If no senders are specified, the `execute` function MUST recover the senders for the
-    /// provided block's transactions internally. We use this to allow for calculating senders in
-    /// parallel in e.g. staged sync, so that execution can happen without paying for sender
-    /// recovery costs.
-    fn execute(
-        &mut self,
-        block: &Block,
-        total_difficulty: U256,
-        senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError>;
+///
+/// This type is capable of executing (multiple) blocks by applying the state changes made by each
+/// block. The final state of the executor can extracted using
+/// [`Self::take_output_state`].
+pub trait BlockExecutor {
+    /// The error type returned by the executor.
+    type Error;
 
-    /// Executes the block and checks receipts
+    /// Executes the entire block and verifies:
+    ///  - receipts (receipts root)
+    ///
+    /// This will update the state of the executor with the changes made by the block.
     fn execute_and_verify_receipt(
         &mut self,
-        block: &Block,
+        block: &BlockWithSenders,
         total_difficulty: U256,
-        senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError>;
+    ) -> Result<(), Self::Error>;
+
+    /// Runs the provided transactions and commits their state to the run-time database.
+    ///
+    /// The returned [BundleStateWithReceipts] can be used to persist the changes to disk, and
+    /// contains the changes made by each transaction.
+    ///
+    /// The changes in [BundleStateWithReceipts] have a transition ID associated with them: there is
+    /// one transition ID for each transaction (with the first executed tx having transition ID
+    /// 0, and so on).
+    ///
+    /// The second returned value represents the total gas used by this block of transactions.
+    ///
+    /// See [execute_and_verify_receipt](BlockExecutor::execute_and_verify_receipt) for more
+    /// details.
+    fn execute_transactions(
+        &mut self,
+        block: &BlockWithSenders,
+        total_difficulty: U256,
+    ) -> Result<(Vec<Receipt>, u64), Self::Error>;
+
+    /// Return bundle state. This is output of executed blocks.
+    fn take_output_state(&mut self) -> BundleStateWithReceipts;
+
+    /// Returns the size hint of current in-memory changes.
+    fn size_hint(&self) -> Option<usize>;
+}
+
+/// A [BlockExecutor] capable of in-memory pruning of the data that will be written to the database.
+pub trait PrunableBlockExecutor: BlockExecutor {
+    /// Set tip - highest known block number.
+    fn set_tip(&mut self, tip: BlockNumber);
+
+    /// Set prune modes.
+    fn set_prune_modes(&mut self, prune_modes: PruneModes);
 }

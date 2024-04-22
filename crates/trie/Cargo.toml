@@ -6,36 +6,41 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = """
-Merkle trie implementation
-"""
+description = "Merkle trie implementation"
+
+[lints]
+workspace = true
 
 [dependencies]
 # reth
 reth-primitives.workspace = true
 reth-interfaces.workspace = true
-reth-rlp.workspace = true
-reth-db = { path = "../storage/db" }
+reth-db.workspace = true
+revm.workspace = true
 
-# tokio
-tokio = { workspace = true, default-features = false, features = ["sync"] }
+# alloy
+alloy-rlp.workspace = true
 
 # tracing
 tracing.workspace = true
 
-# misc 
-hex = "0.4"
+# misc
 thiserror.workspace = true
-derive_more = "0.99"
+derive_more.workspace = true
+auto_impl.workspace = true
 
-# test-utils
+# `metrics` feature
+reth-metrics = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+
+# `test-utils` feature
 triehash = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # reth
 reth-primitives = { workspace = true, features = ["test-utils", "arbitrary"] }
-reth-db = { path = "../storage/db", features = ["test-utils"] }
-reth-provider.workspace = true
+reth-db = { workspace = true, features = ["test-utils"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
 
 # trie
 triehash = "0.8"
@@ -44,9 +49,13 @@ triehash = "0.8"
 proptest.workspace = true
 tokio = { workspace = true, default-features = false, features = ["sync", "rt", "macros"] }
 tokio-stream.workspace = true
-criterion = "0.5"
+once_cell.workspace = true
+serde_json.workspace = true
+similar-asserts.workspace = true
+criterion.workspace = true
 
 [features]
+metrics = ["reth-metrics", "dep:metrics"]
 test-utils = ["triehash"]
 
 [[bench]]

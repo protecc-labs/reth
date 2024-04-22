@@ -1,8 +1,13 @@
 //! Ethereum protocol-related constants
 
-use crate::{H256, U256};
-use hex_literal::hex;
+use crate::{
+    revm_primitives::{address, b256},
+    Address, B256, U256,
+};
 use std::time::Duration;
+
+#[cfg(feature = "optimism")]
+use crate::chain::BaseFeeParams;
 
 /// [EIP-4844](https://eips.ethereum.org/EIPS/eip-4844#parameters) constants.
 pub mod eip4844;
@@ -32,8 +37,7 @@ pub const EPOCH_DURATION: Duration = Duration::from_secs(12 * EPOCH_SLOTS);
 pub const BEACON_NONCE: u64 = 0u64;
 
 /// The default Ethereum block gas limit.
-///
-/// TODO: This should be a chain spec parameter.
+// TODO: This should be a chain spec parameter.
 /// See <https://github.com/paradigmxyz/reth/issues/3233>.
 pub const ETHEREUM_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
@@ -45,7 +49,7 @@ pub const ETHEREUM_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 /// 12.5% of 7 is less than 1.
 ///
 /// Note that min base fee under different 1559 parameterizations may differ, but there's no
-/// signifant harm in leaving this setting as is.
+/// significant harm in leaving this setting as is.
 pub const MIN_PROTOCOL_BASE_FEE: u64 = 7;
 
 /// Same as [MIN_PROTOCOL_BASE_FEE] but as a U256.
@@ -60,6 +64,67 @@ pub const EIP1559_DEFAULT_BASE_FEE_MAX_CHANGE_DENOMINATOR: u64 = 8;
 /// Elasticity multiplier as defined in [EIP-1559](https://eips.ethereum.org/EIPS/eip-1559)
 pub const EIP1559_DEFAULT_ELASTICITY_MULTIPLIER: u64 = 2;
 
+/// Minimum gas limit allowed for transactions.
+pub const MINIMUM_GAS_LIMIT: u64 = 5000;
+
+/// Base fee max change denominator for Optimism Mainnet as defined in the Optimism
+/// [transaction costs](https://community.optimism.io/docs/developers/build/differences/#transaction-costs) doc.
+#[cfg(feature = "optimism")]
+pub const OP_MAINNET_EIP1559_DEFAULT_BASE_FEE_MAX_CHANGE_DENOMINATOR: u128 = 50;
+
+/// Base fee max change denominator for Optimism Mainnet as defined in the Optimism Canyon
+/// hardfork.
+#[cfg(feature = "optimism")]
+pub const OP_MAINNET_EIP1559_BASE_FEE_MAX_CHANGE_DENOMINATOR_CANYON: u128 = 250;
+
+/// Base fee max change denominator for Optimism Mainnet as defined in the Optimism
+/// [transaction costs](https://community.optimism.io/docs/developers/build/differences/#transaction-costs) doc.
+#[cfg(feature = "optimism")]
+pub const OP_MAINNET_EIP1559_DEFAULT_ELASTICITY_MULTIPLIER: u128 = 6;
+
+/// Base fee max change denominator for Optimism Sepolia as defined in the Optimism
+/// [transaction costs](https://community.optimism.io/docs/developers/build/differences/#transaction-costs) doc.
+#[cfg(feature = "optimism")]
+pub const OP_SEPOLIA_EIP1559_DEFAULT_BASE_FEE_MAX_CHANGE_DENOMINATOR: u128 = 50;
+
+/// Base fee max change denominator for Optimism Sepolia as defined in the Optimism Canyon
+/// hardfork.
+#[cfg(feature = "optimism")]
+pub const OP_SEPOLIA_EIP1559_BASE_FEE_MAX_CHANGE_DENOMINATOR_CANYON: u128 = 250;
+
+/// Base fee max change denominator for Optimism Sepolia as defined in the Optimism
+/// [transaction costs](https://community.optimism.io/docs/developers/build/differences/#transaction-costs) doc.
+#[cfg(feature = "optimism")]
+pub const OP_SEPOLIA_EIP1559_DEFAULT_ELASTICITY_MULTIPLIER: u128 = 10;
+
+/// Get the base fee parameters for Optimism Sepolia.
+#[cfg(feature = "optimism")]
+pub const OP_SEPOLIA_BASE_FEE_PARAMS: BaseFeeParams = BaseFeeParams {
+    max_change_denominator: OP_SEPOLIA_EIP1559_DEFAULT_BASE_FEE_MAX_CHANGE_DENOMINATOR,
+    elasticity_multiplier: OP_SEPOLIA_EIP1559_DEFAULT_ELASTICITY_MULTIPLIER,
+};
+
+/// Get the base fee parameters for Optimism Sepolia (post Canyon).
+#[cfg(feature = "optimism")]
+pub const OP_SEPOLIA_CANYON_BASE_FEE_PARAMS: BaseFeeParams = BaseFeeParams {
+    max_change_denominator: OP_SEPOLIA_EIP1559_BASE_FEE_MAX_CHANGE_DENOMINATOR_CANYON,
+    elasticity_multiplier: OP_SEPOLIA_EIP1559_DEFAULT_ELASTICITY_MULTIPLIER,
+};
+
+/// Get the base fee parameters for Optimism Mainnet.
+#[cfg(feature = "optimism")]
+pub const OP_BASE_FEE_PARAMS: BaseFeeParams = BaseFeeParams {
+    max_change_denominator: OP_MAINNET_EIP1559_DEFAULT_BASE_FEE_MAX_CHANGE_DENOMINATOR,
+    elasticity_multiplier: OP_MAINNET_EIP1559_DEFAULT_ELASTICITY_MULTIPLIER,
+};
+
+/// Get the base fee parameters for Optimism Mainnet (post Canyon).
+#[cfg(feature = "optimism")]
+pub const OP_CANYON_BASE_FEE_PARAMS: BaseFeeParams = BaseFeeParams {
+    max_change_denominator: OP_MAINNET_EIP1559_BASE_FEE_MAX_CHANGE_DENOMINATOR_CANYON,
+    elasticity_multiplier: OP_MAINNET_EIP1559_DEFAULT_ELASTICITY_MULTIPLIER,
+};
+
 /// Multiplier for converting gwei to wei.
 pub const GWEI_TO_WEI: u64 = 1_000_000_000;
 
@@ -73,41 +138,45 @@ pub const ETH_TO_WEI: u128 = FINNEY_TO_WEI * 1000;
 pub const MGAS_TO_GAS: u64 = 1_000_000u64;
 
 /// The Ethereum mainnet genesis hash.
-pub const MAINNET_GENESIS: H256 =
-    H256(hex!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"));
+pub const MAINNET_GENESIS_HASH: B256 =
+    b256!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3");
 
 /// Goerli genesis hash.
-pub const GOERLI_GENESIS: H256 =
-    H256(hex!("bf7e331f7f7c1dd2e05159666b3bf8bc7a8a3a9eb1d518969eab529dd9b88c1a"));
+pub const GOERLI_GENESIS_HASH: B256 =
+    b256!("bf7e331f7f7c1dd2e05159666b3bf8bc7a8a3a9eb1d518969eab529dd9b88c1a");
 
 /// Sepolia genesis hash.
-pub const SEPOLIA_GENESIS: H256 =
-    H256(hex!("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9"));
+pub const SEPOLIA_GENESIS_HASH: B256 =
+    b256!("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9");
+
+/// Holesky genesis hash.
+pub const HOLESKY_GENESIS_HASH: B256 =
+    b256!("ff9006519a8ce843ac9c28549d24211420b546e12ce2d170c77a8cca7964f23d");
 
 /// Testnet genesis hash.
-pub const DEV_GENESIS: H256 =
-    H256(hex!("2f980576711e3617a5e4d83dd539548ec0f7792007d505a3d2e9674833af2d7c"));
+pub const DEV_GENESIS_HASH: B256 =
+    b256!("2f980576711e3617a5e4d83dd539548ec0f7792007d505a3d2e9674833af2d7c");
 
 /// Keccak256 over empty array.
-pub const KECCAK_EMPTY: H256 =
-    H256(hex!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"));
+pub const KECCAK_EMPTY: B256 =
+    b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
 /// Ommer root of empty list.
-pub const EMPTY_OMMER_ROOT: H256 =
-    H256(hex!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"));
+pub const EMPTY_OMMER_ROOT_HASH: B256 =
+    b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347");
 
-/// hash of an empty set `keccak256(rlp([]))`
-const EMPTY_SET_HASH: H256 =
-    H256(hex!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"));
+/// Root hash of an empty trie.
+pub const EMPTY_ROOT_HASH: B256 =
+    b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
 
 /// Transactions root of empty receipts set.
-pub const EMPTY_RECEIPTS: H256 = EMPTY_SET_HASH;
+pub const EMPTY_RECEIPTS: B256 = EMPTY_ROOT_HASH;
 
 /// Transactions root of empty transactions set.
-pub const EMPTY_TRANSACTIONS: H256 = EMPTY_SET_HASH;
+pub const EMPTY_TRANSACTIONS: B256 = EMPTY_ROOT_HASH;
 
 /// Withdrawals root of empty withdrawals set.
-pub const EMPTY_WITHDRAWALS: H256 = EMPTY_SET_HASH;
+pub const EMPTY_WITHDRAWALS: B256 = EMPTY_ROOT_HASH;
 
 /// The number of blocks to unwind during a reorg that already became a part of canonical chain.
 ///
@@ -127,6 +196,13 @@ pub const BEACON_CONSENSUS_REORG_UNWIND_DEPTH: u64 = 3;
 /// See:
 /// <https://github.com/ethereum/go-ethereum/blob/a196f3e8a22b6ad22ced5c2e3baf32bc3ebd4ec9/consensus/ethash/consensus.go#L227-L229>
 pub const ALLOWED_FUTURE_BLOCK_TIME_SECONDS: u64 = 15;
+
+/// The address for the beacon roots contract defined in EIP-4788.
+pub const BEACON_ROOTS_ADDRESS: Address = address!("000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
+
+/// The caller to be used when calling the EIP-4788 beacon roots contract at the beginning of the
+/// block.
+pub const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
 
 #[cfg(test)]
 mod tests {

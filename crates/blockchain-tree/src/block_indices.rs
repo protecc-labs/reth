@@ -1,6 +1,6 @@
 //! Implementation of [`BlockIndices`] related to [`super::BlockchainTree`]
 
-use super::chain::BlockChainId;
+use super::state::BlockChainId;
 use crate::canonical_chain::CanonicalChain;
 use linked_hash_set::LinkedHashSet;
 use reth_primitives::{BlockHash, BlockNumHash, BlockNumber, SealedBlockWithSenders};
@@ -109,11 +109,6 @@ impl BlockIndices {
         self.canonical_chain.get_canonical_block_number(self.last_finalized_block, block_hash)
     }
 
-    /// Check if block hash belongs to canonical chain.
-    pub(crate) fn is_block_hash_canonical(&self, block_hash: &BlockHash) -> bool {
-        self.get_canonical_block_number(block_hash).is_some()
-    }
-
     /// Last finalized block
     pub fn last_finalized_block(&self) -> BlockNumber {
         self.last_finalized_block
@@ -149,7 +144,7 @@ impl BlockIndices {
     }
 
     /// Update all block hashes. iterate over present and new list of canonical hashes and compare
-    /// them. Remove all missmatches, disconnect them and return all chains that needs to be
+    /// them. Remove all mismatches, disconnect them and return all chains that needs to be
     /// removed.
     pub(crate) fn update_block_hashes(
         &mut self,
@@ -169,7 +164,7 @@ impl BlockIndices {
 
         loop {
             let Some(old_block_value) = old_hash else {
-                // end of old_hashes canonical chain. New chain has more block then old chain.
+                // end of old_hashes canonical chain. New chain has more blocks than old chain.
                 while let Some(new) = new_hash {
                     // add new blocks to added list.
                     added.push(new.into());
@@ -204,14 +199,14 @@ impl BlockIndices {
                     old_hash = old_hashes.next();
                 }
                 std::cmp::Ordering::Greater => {
-                    // old chain has more past blocks that new chain
+                    // old chain has more past blocks than new chain
                     removed.push(old_block_value);
                     old_hash = old_hashes.next()
                 }
             }
         }
 
-        // remove childs of removed blocks
+        // remove children of removed blocks
         (
             removed.into_iter().fold(BTreeSet::new(), |mut fold, (number, hash)| {
                 fold.extend(self.remove_block(number, hash));
@@ -221,15 +216,17 @@ impl BlockIndices {
         )
     }
 
-    /// Remove chain from indices and return dependent chains that needs to be removed.
+    /// Remove chain from indices and return dependent chains that need to be removed.
     /// Does the cleaning of the tree and removing blocks from the chain.
     pub fn remove_chain(&mut self, chain: &Chain) -> BTreeSet<BlockChainId> {
-        let mut lose_chains = BTreeSet::new();
-        for (block_number, block) in chain.blocks().iter() {
-            let block_hash = block.hash();
-            lose_chains.extend(self.remove_block(*block_number, block_hash))
-        }
-        lose_chains
+        chain
+            .blocks()
+            .iter()
+            .flat_map(|(block_number, block)| {
+                let block_hash = block.hash();
+                self.remove_block(*block_number, block_hash)
+            })
+            .collect()
     }
 
     /// Remove Blocks from indices.
@@ -316,7 +313,7 @@ impl BlockIndices {
     /// this is function that is going to remove N number of last canonical hashes.
     ///
     /// NOTE: This is not safe standalone, as it will not disconnect
-    /// blocks that depends on unwinded canonical chain. And should be
+    /// blocks that depend on unwinded canonical chain. And should be
     /// used when canonical chain is reinserted inside Tree.
     pub(crate) fn unwind_canonical_chain(&mut self, unwind_to: BlockNumber) {
         // this will remove all blocks numbers that are going to be replaced.
@@ -383,7 +380,7 @@ impl BlockIndices {
         self.canonical_chain.tip()
     }
 
-    /// Canonical chain needed for execution of EVM. It should contains last 256 block hashes.
+    /// Canonical chain needed for execution of EVM. It should contain last 256 block hashes.
     #[inline]
     pub(crate) fn canonical_chain(&self) -> &CanonicalChain {
         &self.canonical_chain

@@ -1,8 +1,10 @@
-use std::mem;
-
-use crate::{constants::GWEI_TO_WEI, serde_helper::u64_hex, Address, U256};
+use crate::{constants::GWEI_TO_WEI, serde_helper::u64_hex, Address};
+use alloy_rlp::{RlpDecodable, RlpDecodableWrapper, RlpEncodable, RlpEncodableWrapper};
 use reth_codecs::{main_codec, Compact};
-use reth_rlp::{RlpDecodable, RlpEncodable};
+use std::{
+    mem,
+    ops::{Deref, DerefMut},
+};
 
 /// Withdrawal represents a validator withdrawal from the consensus layer.
 #[main_codec]
@@ -23,14 +25,99 @@ pub struct Withdrawal {
 
 impl Withdrawal {
     /// Return the withdrawal amount in wei.
-    pub fn amount_wei(&self) -> U256 {
-        U256::from(self.amount) * U256::from(GWEI_TO_WEI)
+    pub fn amount_wei(&self) -> u128 {
+        self.amount as u128 * GWEI_TO_WEI as u128
     }
 
     /// Calculate a heuristic for the in-memory size of the [Withdrawal].
     #[inline]
     pub fn size(&self) -> usize {
         mem::size_of::<Self>()
+    }
+}
+
+impl From<reth_rpc_types::Withdrawal> for Withdrawal {
+    fn from(withdrawal: reth_rpc_types::Withdrawal) -> Self {
+        Self {
+            index: withdrawal.index,
+            validator_index: withdrawal.index,
+            address: withdrawal.address,
+            amount: withdrawal.amount,
+        }
+    }
+}
+
+/// Represents a collection of Withdrawals.
+#[main_codec]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash, RlpEncodableWrapper, RlpDecodableWrapper)]
+pub struct Withdrawals(Vec<Withdrawal>);
+
+impl Withdrawals {
+    /// Create a new Withdrawals instance.
+    pub fn new(withdrawals: Vec<Withdrawal>) -> Self {
+        Self(withdrawals)
+    }
+
+    /// Calculate the total size, including capacity, of the Withdrawals.
+    #[inline]
+    pub fn total_size(&self) -> usize {
+        self.size() + self.capacity() * std::mem::size_of::<Withdrawal>()
+    }
+
+    /// Calculate a heuristic for the in-memory size of the [Withdrawals].
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.iter().map(Withdrawal::size).sum()
+    }
+
+    /// Get an iterator over the Withdrawals.
+    pub fn iter(&self) -> std::slice::Iter<'_, Withdrawal> {
+        self.0.iter()
+    }
+
+    /// Get a mutable iterator over the Withdrawals.
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Withdrawal> {
+        self.0.iter_mut()
+    }
+
+    /// Convert [Self] into raw vec of withdrawals.
+    pub fn into_inner(self) -> Vec<Withdrawal> {
+        self.0
+    }
+}
+
+impl IntoIterator for Withdrawals {
+    type Item = Withdrawal;
+    type IntoIter = std::vec::IntoIter<Withdrawal>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl AsRef<[Withdrawal]> for Withdrawals {
+    fn as_ref(&self) -> &[Withdrawal] {
+        &self.0
+    }
+}
+
+impl Deref for Withdrawals {
+    type Target = Vec<Withdrawal>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Withdrawals {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<Vec<reth_rpc_types::Withdrawal>> for Withdrawals {
+    fn from(withdrawals: Vec<reth_rpc_types::Withdrawal>) -> Self {
+        Self(withdrawals.into_iter().map(Into::into).collect())
     }
 }
 

@@ -1,10 +1,14 @@
 //! Round-trip encoding fuzzing for the `eth-wire` crate.
-use reth_rlp::{Decodable, Encodable};
+
+// TODO: remove when https://github.com/proptest-rs/proptest/pull/427 is merged
+#![allow(unknown_lints, non_local_definitions)]
+
+use alloy_rlp::{Decodable, Encodable};
 use serde::Serialize;
 use std::fmt::Debug;
 
-/// Creates a fuzz test for a type that should be [`Encodable`](reth_rlp::Encodable) and
-/// [`Decodable`](reth_rlp::Decodable).
+/// Creates a fuzz test for a type that should be [`Encodable`](alloy_rlp::Encodable) and
+/// [`Decodable`](alloy_rlp::Decodable).
 ///
 /// The test will create a random instance of the type, encode it, and then decode it.
 fn roundtrip_encoding<T>(thing: T)
@@ -36,18 +40,18 @@ where
 macro_rules! fuzz_type_and_name {
     ( $x:ty, $fuzzname:ident ) => {
         /// Fuzzes the round-trip encoding of the type.
-        #[test_fuzz]
         #[allow(non_snake_case)]
+        #[test_fuzz]
         fn $fuzzname(thing: $x) {
             crate::roundtrip_fuzz::<$x>(thing)
         }
     };
 }
 
-#[allow(non_snake_case)]
 #[cfg(any(test, feature = "bench"))]
 pub mod fuzz_rlp {
     use crate::roundtrip_encoding;
+    use alloy_rlp::{RlpDecodableWrapper, RlpEncodableWrapper};
     use reth_codecs::derive_arbitrary;
     use reth_eth_wire::{
         BlockBodies, BlockHeaders, DisconnectReason, GetBlockBodies, GetBlockHeaders, GetNodeData,
@@ -56,7 +60,6 @@ pub mod fuzz_rlp {
         PooledTransactions, Receipts, Status, Transactions,
     };
     use reth_primitives::{BlockHashOrNumber, TransactionSigned};
-    use reth_rlp::{RlpDecodableWrapper, RlpEncodableWrapper};
     use serde::{Deserialize, Serialize};
     use test_fuzz::test_fuzz;
 
@@ -131,7 +134,7 @@ pub mod fuzz_rlp {
         RlpEncodableWrapper,
         RlpDecodableWrapper,
     )]
-    struct GetBlockHeadersWrapper(pub GetBlockHeaders);
+    struct GetBlockHeadersWrapper(GetBlockHeaders);
 
     impl Default for GetBlockHeadersWrapper {
         fn default() -> Self {

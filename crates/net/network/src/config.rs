@@ -5,24 +5,22 @@ use crate::{
     import::{BlockImport, ProofOfStakeBlockImport},
     peers::PeersConfig,
     session::SessionsConfig,
+    transactions::TransactionsManagerConfig,
     NetworkHandle, NetworkManager,
 };
-use reth_discv4::{Discv4Config, Discv4ConfigBuilder, DEFAULT_DISCOVERY_PORT};
+use reth_discv4::{Discv4Config, Discv4ConfigBuilder, DEFAULT_DISCOVERY_ADDRESS};
+use reth_discv5::config::OPSTACK;
 use reth_dns_discovery::DnsDiscoveryConfig;
-use reth_ecies::util::pk2id;
-use reth_eth_wire::{HelloMessage, Status};
+use reth_eth_wire::{HelloMessage, HelloMessageWithProtocols, Status};
 use reth_primitives::{
-    mainnet_nodes, sepolia_nodes, ChainSpec, ForkFilter, Head, NodeRecord, PeerId, MAINNET,
+    mainnet_nodes, pk2id, sepolia_nodes, ChainSpec, ForkFilter, Head, NodeRecord, PeerId, MAINNET,
 };
 use reth_provider::{BlockReader, HeaderProvider};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use secp256k1::SECP256K1;
-use std::{
-    collections::HashSet,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 // re-export for convenience
+use crate::protocol::{IntoRlpxSubProtocol, RlpxSubProtocols};
 pub use secp256k1::SecretKey;
 
 /// Convenience function to create a new random [`SecretKey`]
@@ -31,6 +29,7 @@ pub fn rng_secret_key() -> SecretKey {
 }
 
 /// All network related initialization settings.
+#[derive(Debug)]
 pub struct NetworkConfig<C> {
     /// The client type that can interact with the chain.
     ///
@@ -43,10 +42,12 @@ pub struct NetworkConfig<C> {
     pub boot_nodes: HashSet<NodeRecord>,
     /// How to set up discovery over DNS.
     pub dns_discovery_config: Option<DnsDiscoveryConfig>,
+    /// Address to use for discovery v4.
+    pub discovery_v4_addr: SocketAddr,
     /// How to set up discovery.
     pub discovery_v4_config: Option<Discv4Config>,
-    /// Address to use for discovery
-    pub discovery_addr: SocketAddr,
+    /// How to set up discovery version 5.
+    pub discovery_v5_config: Option<reth_discv5::Config>,
     /// Address to listen for incoming connections
     pub listener_addr: SocketAddr,
     /// How to instantiate peer manager.
@@ -71,25 +72,71 @@ pub struct NetworkConfig<C> {
     /// The `Status` message to send to peers at the beginning.
     pub status: Status,
     /// Sets the hello message for the p2p handshake in RLPx
-    pub hello_message: HelloMessage,
+    pub hello_message: HelloMessageWithProtocols,
+    /// Additional protocols to announce and handle in RLPx
+    pub extra_protocols: RlpxSubProtocols,
+    /// Whether to disable transaction gossip
+    pub tx_gossip_disabled: bool,
+    /// How to instantiate transactions manager.
+    pub transactions_manager_config: TransactionsManagerConfig,
 }
 
 // === impl NetworkConfig ===
 
-impl<C> NetworkConfig<C> {
-    /// Create a new instance with all mandatory fields set, rest is field with defaults.
-    pub fn new(client: C, secret_key: SecretKey) -> Self {
-        Self::builder(secret_key).build(client)
-    }
-
+impl NetworkConfig<()> {
     /// Convenience method for creating the corresponding builder type
     pub fn builder(secret_key: SecretKey) -> NetworkConfigBuilder {
         NetworkConfigBuilder::new(secret_key)
+    }
+}
+
+impl<C> NetworkConfig<C> {
+    /// Create a new instance with all mandatory fields set, rest is field with defaults.
+    pub fn new(client: C, secret_key: SecretKey) -> Self {
+        NetworkConfig::builder(secret_key).build(client)
     }
 
     /// Sets the config to use for the discovery v4 protocol.
     pub fn set_discovery_v4(mut self, discovery_config: Discv4Config) -> Self {
         self.discovery_v4_config = Some(discovery_config);
+        self
+    }
+
+    /// Sets the config to use for the discovery v5 protocol, with help of the
+    /// [`reth_discv5::ConfigBuilder`].
+    /// ```
+    /// use reth_network::NetworkConfigBuilder;
+    /// use secp256k1::{rand::thread_rng, SecretKey};
+    ///
+    /// let sk = SecretKey::new(&mut thread_rng());
+    /// let network_config = NetworkConfigBuilder::new(sk).build(());
+    /// let fork_id = network_config.status.forkid;
+    /// let network_config = network_config
+    ///     .discovery_v5_with_config_builder(|builder| builder.fork(b"eth", fork_id).build());
+    /// ```
+
+    pub fn discovery_v5_with_config_builder(
+        self,
+        f: impl FnOnce(reth_discv5::ConfigBuilder) -> reth_discv5::Config,
+    ) -> Self {
+        let rlpx_port = self.listener_addr.port();
+        let chain = self.chain_spec.chain;
+        let fork_id = self.status.forkid;
+        let boot_nodes = self.boot_nodes.clone();
+
+        let mut builder =
+            reth_discv5::Config::builder(rlpx_port).add_unsigned_boot_nodes(boot_nodes.into_iter());
+
+        if chain.is_optimism() {
+            builder = builder.fork(OPSTACK, fork_id)
+        }
+
+        self.set_discovery_v5(f(builder))
+    }
+
+    /// Sets the config to use for the discovery v5 protocol.
+    pub fn set_discovery_v5(mut self, discv5_config: reth_discv5::Config) -> Self {
+        self.discovery_v5_config = Some(discv5_config);
         self
     }
 
@@ -120,14 +167,15 @@ where
 /// Builder for [`NetworkConfig`](struct.NetworkConfig.html).
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[allow(missing_docs)]
 pub struct NetworkConfigBuilder {
     /// The node's secret key, from which the node's identity is derived.
     secret_key: SecretKey,
     /// How to configure discovery over DNS.
     dns_discovery_config: Option<DnsDiscoveryConfig>,
-    /// How to set up discovery.
+    /// How to set up discovery version 4.
     discovery_v4_builder: Option<Discv4ConfigBuilder>,
+    /// Whether to enable discovery version 5. Disabled by default.
+    enable_discovery_v5: bool,
     /// All boot nodes to start network discovery with.
     boot_nodes: HashSet<NodeRecord>,
     /// Address to use for discovery
@@ -146,9 +194,19 @@ pub struct NetworkConfigBuilder {
     #[serde(skip)]
     executor: Option<Box<dyn TaskSpawner>>,
     /// Sets the hello message for the p2p handshake in RLPx
-    hello_message: Option<HelloMessage>,
+    hello_message: Option<HelloMessageWithProtocols>,
+    /// The executor to use for spawning tasks.
+    #[serde(skip)]
+    extra_protocols: RlpxSubProtocols,
     /// Head used to start set for the fork filter and status.
     head: Option<Head>,
+    /// Whether tx gossip is disabled
+    tx_gossip_disabled: bool,
+    /// The block importer type
+    #[serde(skip)]
+    block_import: Option<Box<dyn BlockImport>>,
+    /// How to instantiate transactions manager.
+    transactions_manager_config: TransactionsManagerConfig,
 }
 
 // === impl NetworkConfigBuilder ===
@@ -160,6 +218,7 @@ impl NetworkConfigBuilder {
             secret_key,
             dns_discovery_config: Some(Default::default()),
             discovery_v4_builder: Some(Default::default()),
+            enable_discovery_v5: false,
             boot_nodes: Default::default(),
             discovery_addr: None,
             listener_addr: None,
@@ -169,7 +228,11 @@ impl NetworkConfigBuilder {
             network_mode: Default::default(),
             executor: None,
             hello_message: None,
+            extra_protocols: Default::default(),
             head: None,
+            tx_gossip_disabled: false,
+            block_import: None,
+            transactions_manager_config: Default::default(),
         }
     }
 
@@ -206,13 +269,11 @@ impl NetworkConfigBuilder {
     /// # use reth_eth_wire::HelloMessage;
     /// # use reth_network::NetworkConfigBuilder;
     /// # fn builder(builder: NetworkConfigBuilder) {
-    ///    let peer_id = builder.get_peer_id();
-    ///     builder.hello_message(
-    ///         HelloMessage::builder(peer_id).build()
-    /// );
+    /// let peer_id = builder.get_peer_id();
+    /// builder.hello_message(HelloMessage::builder(peer_id).build());
     /// # }
     /// ```
-    pub fn hello_message(mut self, hello_message: HelloMessage) -> Self {
+    pub fn hello_message(mut self, hello_message: HelloMessageWithProtocols) -> Self {
         self.hello_message = Some(hello_message);
         self
     }
@@ -237,19 +298,25 @@ impl NetworkConfigBuilder {
         self
     }
 
+    pub fn transactions_manager_config(mut self, config: TransactionsManagerConfig) -> Self {
+        self.transactions_manager_config = config;
+        self
+    }
+
     /// Sets the discovery and listener address
     ///
     /// This is a convenience function for both [NetworkConfigBuilder::listener_addr] and
     /// [NetworkConfigBuilder::discovery_addr].
     ///
-    /// By default, both are on the same port: [DEFAULT_DISCOVERY_PORT]
+    /// By default, both are on the same port:
+    /// [DEFAULT_DISCOVERY_PORT](reth_discv4::DEFAULT_DISCOVERY_PORT)
     pub fn set_addrs(self, addr: SocketAddr) -> Self {
         self.listener_addr(addr).discovery_addr(addr)
     }
 
     /// Sets the socket address the network will listen on.
     ///
-    /// By default, this is [Ipv4Addr::UNSPECIFIED] on [DEFAULT_DISCOVERY_PORT]
+    /// By default, this is [DEFAULT_DISCOVERY_ADDRESS]
     pub fn listener_addr(mut self, listener_addr: SocketAddr) -> Self {
         self.listener_addr = Some(listener_addr);
         self
@@ -257,11 +324,9 @@ impl NetworkConfigBuilder {
 
     /// Sets the port of the address the network will listen on.
     ///
-    /// By default, this is [DEFAULT_DISCOVERY_PORT]
+    /// By default, this is [DEFAULT_DISCOVERY_PORT](reth_discv4::DEFAULT_DISCOVERY_PORT)
     pub fn listener_port(mut self, port: u16) -> Self {
-        self.listener_addr
-            .get_or_insert(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_DISCOVERY_PORT).into())
-            .set_port(port);
+        self.listener_addr.get_or_insert(DEFAULT_DISCOVERY_ADDRESS).set_port(port);
         self
     }
 
@@ -271,9 +336,24 @@ impl NetworkConfigBuilder {
         self
     }
 
+    /// Sets the port of the address the discovery network will listen on.
+    ///
+    /// By default, this is [DEFAULT_DISCOVERY_PORT](reth_discv4::DEFAULT_DISCOVERY_PORT)
+    pub fn discovery_port(mut self, port: u16) -> Self {
+        self.discovery_addr.get_or_insert(DEFAULT_DISCOVERY_ADDRESS).set_port(port);
+        self
+    }
+
     /// Sets the discv4 config to use.
+    //
     pub fn discovery(mut self, builder: Discv4ConfigBuilder) -> Self {
         self.discovery_v4_builder = Some(builder);
+        self
+    }
+
+    /// Allows discv5 discovery.
+    pub fn discovery_v5(mut self) -> Self {
+        self.enable_discovery_v5 = true;
         self
     }
 
@@ -325,6 +405,12 @@ impl NetworkConfigBuilder {
         self
     }
 
+    /// Enable the Discv5 discovery.
+    pub fn enable_discv5_discovery(mut self) -> Self {
+        self.enable_discovery_v5 = true;
+        self
+    }
+
     /// Disable the DNS discovery if the given condition is true.
     pub fn disable_dns_discovery_if(self, disable: bool) -> Self {
         if disable {
@@ -343,6 +429,32 @@ impl NetworkConfigBuilder {
         }
     }
 
+    /// Adds a new additional protocol to the RLPx sub-protocol list.
+    pub fn add_rlpx_sub_protocol(mut self, protocol: impl IntoRlpxSubProtocol) -> Self {
+        self.extra_protocols.push(protocol);
+        self
+    }
+
+    /// Sets whether tx gossip is disabled.
+    pub fn disable_tx_gossip(mut self, disable_tx_gossip: bool) -> Self {
+        self.tx_gossip_disabled = disable_tx_gossip;
+        self
+    }
+
+    /// Sets the block import type.
+    pub fn block_import(mut self, block_import: Box<dyn BlockImport>) -> Self {
+        self.block_import = Some(block_import);
+        self
+    }
+
+    /// Convenience function for creating a [NetworkConfig] with a noop provider that does nothing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn build_with_noop_provider(
+        self,
+    ) -> NetworkConfig<reth_provider::test_utils::NoopProvider> {
+        self.build(reth_provider::test_utils::NoopProvider::default())
+    }
+
     /// Consumes the type and creates the actual [`NetworkConfig`]
     /// for the given client type that can interact with the chain.
     ///
@@ -355,6 +467,7 @@ impl NetworkConfigBuilder {
             secret_key,
             mut dns_discovery_config,
             discovery_v4_builder,
+            enable_discovery_v5: _,
             boot_nodes,
             discovery_addr,
             listener_addr,
@@ -364,12 +477,14 @@ impl NetworkConfigBuilder {
             network_mode,
             executor,
             hello_message,
+            extra_protocols,
             head,
+            tx_gossip_disabled,
+            block_import,
+            transactions_manager_config,
         } = self;
 
-        let listener_addr = listener_addr.unwrap_or_else(|| {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_DISCOVERY_PORT))
-        });
+        let listener_addr = listener_addr.unwrap_or(DEFAULT_DISCOVERY_ADDRESS);
 
         let mut hello_message =
             hello_message.unwrap_or_else(|| HelloMessage::builder(peer_id).build());
@@ -406,19 +521,21 @@ impl NetworkConfigBuilder {
             boot_nodes,
             dns_discovery_config,
             discovery_v4_config: discovery_v4_builder.map(|builder| builder.build()),
-            discovery_addr: discovery_addr.unwrap_or_else(|| {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_DISCOVERY_PORT))
-            }),
+            discovery_v5_config: None,
+            discovery_v4_addr: discovery_addr.unwrap_or(DEFAULT_DISCOVERY_ADDRESS),
             listener_addr,
             peers_config: peers_config.unwrap_or_default(),
             sessions_config: sessions_config.unwrap_or_default(),
             chain_spec,
-            block_import: Box::<ProofOfStakeBlockImport>::default(),
+            block_import: block_import.unwrap_or_else(|| Box::<ProofOfStakeBlockImport>::default()),
             network_mode,
             executor: executor.unwrap_or_else(|| Box::<TokioTaskExecutor>::default()),
             status,
             hello_message,
+            extra_protocols,
             fork_filter,
+            tx_gossip_disabled,
+            transactions_manager_config,
         }
     }
 }

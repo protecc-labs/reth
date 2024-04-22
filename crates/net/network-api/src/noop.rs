@@ -4,12 +4,14 @@
 //! generic over it.
 
 use crate::{
-    NetworkError, NetworkInfo, PeerKind, Peers, PeersInfo, Reputation, ReputationChangeKind,
+    NetworkError, NetworkInfo, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
+    ReputationChangeKind,
 };
-use async_trait::async_trait;
+use enr::{secp256k1::SecretKey, Enr};
+use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::{DisconnectReason, ProtocolVersion};
 use reth_primitives::{Chain, NodeRecord, PeerId};
-use reth_rpc_types::{EthProtocolInfo, NetworkStatus};
+use reth_rpc_types::{admin::EthProtocolInfo, NetworkStatus};
 use std::net::{IpAddr, SocketAddr};
 
 /// A type that implements all network trait that does nothing.
@@ -19,10 +21,9 @@ use std::net::{IpAddr, SocketAddr};
 #[non_exhaustive]
 pub struct NoopNetwork;
 
-#[async_trait]
 impl NetworkInfo for NoopNetwork {
     fn local_addr(&self) -> SocketAddr {
-        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), 30303).into()
+        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into()
     }
 
     async fn network_status(&self) -> Result<NetworkStatus, NetworkError> {
@@ -31,9 +32,10 @@ impl NetworkInfo for NoopNetwork {
             protocol_version: ProtocolVersion::V5 as u64,
             eth_protocol_info: EthProtocolInfo {
                 difficulty: Default::default(),
-                head: Default::default(),
                 network: 1,
                 genesis: Default::default(),
+                config: Default::default(),
+                head: Default::default(),
             },
         })
     }
@@ -59,11 +61,33 @@ impl PeersInfo for NoopNetwork {
     fn local_node_record(&self) -> NodeRecord {
         NodeRecord::new(self.local_addr(), PeerId::random())
     }
+
+    fn local_enr(&self) -> Enr<SecretKey> {
+        let sk = SecretKey::from_slice(&[0xcd; 32]).unwrap();
+        Enr::builder().build(&sk).unwrap()
+    }
 }
 
-#[async_trait]
 impl Peers for NoopNetwork {
+    fn add_trusted_peer_id(&self, _peer: PeerId) {}
+
     fn add_peer_kind(&self, _peer: PeerId, _kind: PeerKind, _addr: SocketAddr) {}
+
+    async fn get_peers_by_kind(&self, _kind: PeerKind) -> Result<Vec<PeerInfo>, NetworkError> {
+        Ok(vec![])
+    }
+
+    async fn get_all_peers(&self) -> Result<Vec<PeerInfo>, NetworkError> {
+        Ok(vec![])
+    }
+
+    async fn get_peer_by_id(&self, _peer_id: PeerId) -> Result<Option<PeerInfo>, NetworkError> {
+        Ok(None)
+    }
+
+    async fn get_peers_by_id(&self, _peer_id: Vec<PeerId>) -> Result<Vec<PeerInfo>, NetworkError> {
+        Ok(vec![])
+    }
 
     fn remove_peer(&self, _peer: PeerId, _kind: PeerKind) {}
 

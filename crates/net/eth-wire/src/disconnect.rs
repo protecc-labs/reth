@@ -1,12 +1,11 @@
 //! Disconnect
 
-use bytes::Bytes;
+use alloy_rlp::{Decodable, Encodable, Error as RlpError, Header};
 use futures::{Sink, SinkExt};
 use reth_codecs::derive_arbitrary;
 use reth_ecies::stream::ECIESStream;
 use reth_primitives::bytes::{Buf, BufMut};
-use reth_rlp::{Decodable, DecodeError, Encodable, Header};
-use std::fmt::Display;
+use std::{fmt::Display, future::Future};
 use thiserror::Error;
 use tokio::io::AsyncWrite;
 use tokio_util::codec::{Encoder, Framed};
@@ -51,28 +50,27 @@ pub enum DisconnectReason {
 impl Display for DisconnectReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            DisconnectReason::DisconnectRequested => "Disconnect requested",
+            DisconnectReason::DisconnectRequested => "disconnect requested",
             DisconnectReason::TcpSubsystemError => "TCP sub-system error",
             DisconnectReason::ProtocolBreach => {
-                "Breach of protocol, e.g. a malformed message, bad RLP, ..."
+                "breach of protocol, e.g. a malformed message, bad RLP, etc."
             }
-            DisconnectReason::UselessPeer => "Useless peer",
-            DisconnectReason::TooManyPeers => "Too many peers",
-            DisconnectReason::AlreadyConnected => "Already connected",
-            DisconnectReason::IncompatibleP2PProtocolVersion => "Incompatible P2P protocol version",
+            DisconnectReason::UselessPeer => "useless peer",
+            DisconnectReason::TooManyPeers => "too many peers",
+            DisconnectReason::AlreadyConnected => "already connected",
+            DisconnectReason::IncompatibleP2PProtocolVersion => "incompatible P2P protocol version",
             DisconnectReason::NullNodeIdentity => {
-                "Null node identity received - this is automatically invalid"
+                "null node identity received - this is automatically invalid"
             }
-            DisconnectReason::ClientQuitting => "Client quitting",
-            DisconnectReason::UnexpectedHandshakeIdentity => "Unexpected identity in handshake",
+            DisconnectReason::ClientQuitting => "client quitting",
+            DisconnectReason::UnexpectedHandshakeIdentity => "unexpected identity in handshake",
             DisconnectReason::ConnectedToSelf => {
-                "Identity is the same as this node (i.e. connected to itself)"
+                "identity is the same as this node (i.e. connected to itself)"
             }
-            DisconnectReason::PingTimeout => "Ping timeout",
-            DisconnectReason::SubprotocolSpecific => "Some other reason specific to a subprotocol",
+            DisconnectReason::PingTimeout => "ping timeout",
+            DisconnectReason::SubprotocolSpecific => "some other reason specific to a subprotocol",
         };
-
-        write!(f, "{message}")
+        f.write_str(message)
     }
 }
 
@@ -106,9 +104,9 @@ impl TryFrom<u8> for DisconnectReason {
     }
 }
 
-/// The [`Encodable`](reth_rlp::Encodable) implementation for [`DisconnectReason`] encodes the
-/// disconnect reason in a single-element RLP list.
 impl Encodable for DisconnectReason {
+    /// The [`Encodable`] implementation for [`DisconnectReason`] encodes the disconnect reason in
+    /// a single-element RLP list.
     fn encode(&self, out: &mut dyn BufMut) {
         vec![*self as u8].encode(out);
     }
@@ -117,22 +115,27 @@ impl Encodable for DisconnectReason {
     }
 }
 
-/// The [`Decodable`](reth_rlp::Decodable) implementation for [`DisconnectReason`] supports either
-/// a disconnect reason encoded a single byte or a RLP list containing the disconnect reason.
 impl Decodable for DisconnectReason {
-    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+    /// The [`Decodable`] implementation for [`DisconnectReason`] supports either a disconnect
+    /// reason encoded a single byte or a RLP list containing the disconnect reason.
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         if buf.is_empty() {
-            return Err(DecodeError::InputTooShort)
+            return Err(RlpError::InputTooShort)
         } else if buf.len() > 2 {
-            return Err(DecodeError::Overflow)
+            return Err(RlpError::Overflow)
         }
 
         if buf.len() > 1 {
             // this should be a list, so decode the list header. this should advance the buffer so
             // buf[0] is the first (and only) element of the list.
             let header = Header::decode(buf)?;
+
             if !header.list {
-                return Err(DecodeError::UnexpectedString)
+                return Err(RlpError::UnexpectedString)
+            }
+
+            if header.payload_length != 1 {
+                return Err(RlpError::ListLengthMismatch { expected: 1, got: header.payload_length })
             }
         }
 
@@ -143,7 +146,7 @@ impl Decodable for DisconnectReason {
             Ok(DisconnectReason::DisconnectRequested)
         } else {
             DisconnectReason::try_from(u8::decode(buf)?)
-                .map_err(|_| DecodeError::Custom("unknown disconnect reason"))
+                .map_err(|_| RlpError::Custom("unknown disconnect reason"))
         }
     }
 }
@@ -151,19 +154,17 @@ impl Decodable for DisconnectReason {
 /// This trait is meant to allow higher level protocols like `eth` to disconnect from a peer, using
 /// lower-level disconnect functions (such as those that exist in the `p2p` protocol) if the
 /// underlying stream supports it.
-#[async_trait::async_trait]
-pub trait CanDisconnect<T>: Sink<T> + Unpin + Sized {
+pub trait CanDisconnect<T>: Sink<T> + Unpin {
     /// Disconnects from the underlying stream, using a [`DisconnectReason`] as disconnect
     /// information if the stream implements a protocol that can carry the additional disconnect
     /// metadata.
-    async fn disconnect(
+    fn disconnect(
         &mut self,
         reason: DisconnectReason,
-    ) -> Result<(), <Self as Sink<T>>::Error>;
+    ) -> impl Future<Output = Result<(), <Self as Sink<T>>::Error>> + Send;
 }
 
 // basic impls for things like Framed<TcpStream, etc>
-#[async_trait::async_trait]
 impl<T, I, U> CanDisconnect<I> for Framed<T, U>
 where
     T: AsyncWrite + Unpin + Send,
@@ -177,8 +178,7 @@ where
     }
 }
 
-#[async_trait::async_trait]
-impl<S> CanDisconnect<Bytes> for ECIESStream<S>
+impl<S> CanDisconnect<bytes::Bytes> for ECIESStream<S>
 where
     S: AsyncWrite + Unpin + Send,
 {
@@ -190,8 +190,8 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{p2pstream::P2PMessage, DisconnectReason};
+    use alloy_rlp::{Decodable, Encodable};
     use reth_primitives::hex;
-    use reth_rlp::{Decodable, Encodable};
 
     fn all_reasons() -> Vec<DisconnectReason> {
         vec![
@@ -235,6 +235,14 @@ mod tests {
     #[test]
     fn test_reason_too_long() {
         assert!(DisconnectReason::decode(&mut &[0u8; 3][..]).is_err())
+    }
+
+    #[test]
+    fn test_reason_zero_length_list() {
+        let list_with_zero_length = hex::decode("c000").unwrap();
+        let res = DisconnectReason::decode(&mut &list_with_zero_length[..]);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().to_string(), "unexpected list length (got 0, expected 1)")
     }
 
     #[test]
